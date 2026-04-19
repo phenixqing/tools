@@ -92,6 +92,80 @@ function setupUpload() {
 }
 
 /* ────────────────────────────────────────────────────────── */
+/*  FIDELITY SYNC                                             */
+/* ────────────────────────────────────────────────────────── */
+let _syncPollTimer = null;
+
+async function _checkSyncStatus(pollOnRunning = false) {
+  try {
+    const s = await fetchJSON("/api/sync/status");
+    const btn   = document.getElementById("fidelity-sync-btn");
+    const label = document.getElementById("sync-status-label");
+
+    // Update button appearance based on creds
+    if (!s.creds_configured) {
+      btn.title = "Set FIDELITY_USERNAME + FIDELITY_PASSWORD env vars to enable";
+      btn.classList.add("sync-unconfigured");
+    }
+
+    if (s.status === "running") {
+      btn.disabled = true;
+      btn.classList.add("sync-running");
+      label.textContent = s.message || "Syncing…";
+      label.className = "sync-label running";
+      if (pollOnRunning && !_syncPollTimer) {
+        _syncPollTimer = setInterval(() => _checkSyncStatus(true), 3000);
+      }
+    } else {
+      btn.disabled = false;
+      btn.classList.remove("sync-running");
+      clearInterval(_syncPollTimer); _syncPollTimer = null;
+
+      if (s.status === "done") {
+        const ago = s.age_secs != null ? ` (${_fmtAgo(s.age_secs)})` : "";
+        label.textContent = `✓ Synced${ago}`;
+        label.className = "sync-label done";
+      } else if (s.status === "error") {
+        label.textContent = `✗ ${s.last_error?.split("\n")[0] || "Error"}`;
+        label.className = "sync-label error";
+        label.title = s.last_error || "";
+      } else {
+        label.textContent = s.creds_configured ? "" : "⚠ creds not set";
+        label.className = "sync-label";
+      }
+    }
+    return s;
+  } catch(_) { return null; }
+}
+
+function _fmtAgo(secs) {
+  if (secs < 60)   return `${secs}s ago`;
+  if (secs < 3600) return `${Math.round(secs/60)}m ago`;
+  return `${Math.round(secs/3600)}h ago`;
+}
+
+document.getElementById("fidelity-sync-btn")?.addEventListener("click", async () => {
+  const btn   = document.getElementById("fidelity-sync-btn");
+  const label = document.getElementById("sync-status-label");
+  btn.disabled = true;
+  label.textContent = "Starting…";
+  label.className = "sync-label running";
+  try {
+    const res = await fetchJSON("/api/sync/fidelity", { method: "POST" });
+    if (res.status === "already_running") {
+      label.textContent = "Already running…";
+    }
+    // Start polling for completion
+    _checkSyncStatus(true);
+    _syncPollTimer = _syncPollTimer || setInterval(() => _checkSyncStatus(true), 3000);
+  } catch(e) {
+    label.textContent = `✗ ${e.message}`;
+    label.className = "sync-label error";
+    btn.disabled = false;
+  }
+});
+
+/* ────────────────────────────────────────────────────────── */
 /*  SUMMARY CARDS                                             */
 /* ────────────────────────────────────────────────────────── */
 async function loadSummary() {
@@ -1036,9 +1110,11 @@ const _LOG_LABELS = {
   test:     "测试",
   setting:  "设置",
   error:    "错误",
+  sync:     "同步",
 };
 const _LOG_ICONS = {
-  csv_load: "📂", alert: "🚨", warning: "⚠️", test: "📬", setting: "⚙️", error: "❌",
+  csv_load: "📂", alert: "🚨", warning: "⚠️", test: "📬",
+  setting: "⚙️", error: "❌", sync: "🔄",
 };
 
 function _fmtLogTime(isoStr) {
@@ -1090,6 +1166,7 @@ async function reloadAll() {
 
 (async () => {
   setupUpload();
+  _checkSyncStatus(false);   // show last-sync status on page load
   try {
     await reloadAll();
   } catch(err) {

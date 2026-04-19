@@ -87,6 +87,14 @@ _ai_cache: Dict[str, Any] = {
 # ── alert idempotency ──────────────────────────────────────────────────────────
 _alert_sent: set = set()
 
+# ── Fidelity sync state ────────────────────────────────────────────────────────
+_sync_state: Dict[str, Any] = {
+    "status":     "idle",   # idle | running | done | error
+    "last_sync":  None,     # unix timestamp
+    "last_error": None,
+    "message":    None,
+}
+
 # ── notification settings ──────────────────────────────────────────────────────
 _settings: Dict[str, Any] = {
     "warning_pct":    70.0,   # ⚠️  warn when |gain_loss_pct| exceeds this
@@ -797,6 +805,69 @@ async def test_notification():
         channels.append({"name": "Telegram", "status": "error", "detail": str(exc)})
     _log("test", f"手动测试通知 — {', '.join(c['name'] for c in channels)}")
     return {"channels": channels, "message": msg}
+
+
+# ── Fidelity sync ──────────────────────────────────────────────────────────────
+
+async def _run_fidelity_sync() -> None:
+    """Background task: invoke fidelity_sync.run_sync and update _sync_state."""
+    from fidelity_sync import run_sync as _fid_sync
+
+    def _log_sync(msg: str):
+        # Also echo into app event log so Logs tab shows progress
+        _log("sync", msg)
+
+    try:
+        await _fid_sync(output_path=BLOB_CSV, log=_log_sync)
+        _sync_state.update({
+            "status":     "done",
+            "last_sync":  time.time(),
+            "message":    f"Downloaded {BLOB_CSV.name}",
+            "last_error": None,
+        })
+    except Exception as exc:
+        err = str(exc)
+        _sync_state.update({
+            "status":     "error",
+            "last_sync":  time.time(),
+            "last_error": err,
+            "message":    None,
+        })
+        _log("error", f"Fidelity sync 失败: {err[:120]}")
+
+
+@app.post("/api/sync/fidelity")
+async def trigger_fidelity_sync():
+    """Start a background Fidelity portfolio sync. Returns immediately."""
+    if _sync_state["status"] == "running":
+        return {"status": "already_running",
+                "message": "Sync is already in progress."}
+
+    # Quick env-var check before spawning the task
+    if not os.environ.get("FIDELITY_USERNAME") or not os.environ.get("FIDELITY_PASSWORD"):
+        raise HTTPException(
+            status_code=503,
+            detail="FIDELITY_USERNAME and FIDELITY_PASSWORD environment variables are not set.",
+        )
+
+    _sync_state.update({"status": "running", "last_error": None, "message": "Connecting to Fidelity…"})
+    _log("sync", "Fidelity 同步已触发")
+    asyncio.create_task(_run_fidelity_sync())
+    return {"status": "triggered"}
+
+
+@app.get("/api/sync/status")
+def fidelity_sync_status():
+    """Poll the current state of the Fidelity sync."""
+    creds_set = bool(os.environ.get("FIDELITY_USERNAME") and os.environ.get("FIDELITY_PASSWORD"))
+    totp_set  = bool(os.environ.get("FIDELITY_TOTP_SECRET"))
+    return {
+        **_sync_state,
+        "age_secs":  round(time.time() - _sync_state["last_sync"])
+                     if _sync_state["last_sync"] else None,
+        "creds_configured": creds_set,
+        "totp_configured":  totp_set,
+    }
 
 
 # ── static ─────────────────────────────────────────────────────────────────────
