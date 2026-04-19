@@ -1054,7 +1054,80 @@ async function loadSettings() {
     document.getElementById("setting-alert-pct").value   = s.alert_pct;
     document.getElementById("setting-avgo-pct").value    = s.avgo_change_pct;
   } catch(_) {}
+  await loadOngoingSync();
 }
+
+/* ────────────────────────────────────────────────────────── */
+/*  ONGOING SYNC                                              */
+/* ────────────────────────────────────────────────────────── */
+async function loadOngoingSync() {
+  try {
+    const s = await fetchJSON("/api/sync/ongoing");
+    document.getElementById("ongoing-sync-toggle").checked = !!s.enabled;
+    document.getElementById("ongoing-interval").value = s.interval_mins ?? 5;
+    _renderOngoingStatus(s);
+  } catch(_) {}
+}
+
+function _renderOngoingStatus(s) {
+  const badge = document.getElementById("ongoing-status-badge");
+  const lastEl = document.getElementById("ongoing-last-sync");
+  const mktEl  = document.getElementById("ongoing-market-hours");
+  if (!badge) return;
+
+  if (s.status === "running") {
+    badge.textContent = "● Syncing…";
+    badge.className = "ongoing-badge running";
+  } else if (s.status === "done") {
+    badge.textContent = "✓ Active";
+    badge.className = "ongoing-badge done";
+  } else if (s.status === "error") {
+    badge.textContent = "✗ Error";
+    badge.title = s.last_error || "";
+    badge.className = "ongoing-badge error";
+  } else if (s.enabled) {
+    badge.textContent = "⏳ Waiting…";
+    badge.className = "ongoing-badge waiting";
+  } else {
+    badge.textContent = "Off";
+    badge.className = "ongoing-badge off";
+  }
+
+  lastEl.textContent = s.last_sync
+    ? `Last: ${_fmtAgo(s.age_secs)}`
+    : "";
+
+  if (s.enabled) {
+    mktEl.textContent = s.in_market_hours
+      ? "📈 Market hours (running)"
+      : "🕐 Outside market hours (paused)";
+    mktEl.className = s.in_market_hours ? "ongoing-market-hours active" : "ongoing-market-hours muted";
+  } else {
+    mktEl.textContent = "Mon–Fri 06:00–13:00 PT";
+    mktEl.className = "ongoing-market-hours muted";
+  }
+}
+
+document.getElementById("save-ongoing-btn")?.addEventListener("click", async () => {
+  const enabled = document.getElementById("ongoing-sync-toggle").checked;
+  const interval_mins = parseInt(document.getElementById("ongoing-interval").value) || 5;
+  const msg = document.getElementById("ongoing-save-msg");
+  try {
+    const s = await fetchJSON("/api/sync/ongoing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, interval_mins }),
+    });
+    _renderOngoingStatus(s);
+    msg.textContent = "✓ Saved";
+    msg.classList.add("visible");
+    setTimeout(() => msg.classList.remove("visible"), 2500);
+  } catch(e) {
+    msg.textContent = `✗ ${e.message}`;
+    msg.style.color = "var(--red)";
+    msg.classList.add("visible");
+  }
+});
 
 document.getElementById("save-settings-btn").addEventListener("click", async () => {
   const body = {

@@ -672,6 +672,34 @@ td input[type=checkbox] { margin: 0; }
 }
 .settings-save-msg.visible { opacity: 1; }
 
+/* ongoing sync status row */
+.ongoing-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 4px;
+  font-size: .8rem;
+}
+.ongoing-status-label { color: var(--muted); }
+.ongoing-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: .75rem;
+  font-weight: 600;
+  background: var(--card);
+  color: var(--muted);
+}
+.ongoing-badge.running { background: rgba(99,102,241,.2); color: var(--accent-lt); }
+.ongoing-badge.done    { background: rgba(72,199,142,.15); color: var(--green); }
+.ongoing-badge.error   { background: rgba(252,129,74,.15); color: var(--red); cursor: help; }
+.ongoing-badge.waiting { background: rgba(99,102,241,.1); color: var(--accent-lt); }
+.ongoing-badge.off     { background: var(--card); color: var(--muted); }
+.ongoing-last-sync { color: var(--muted); font-size: .75rem; }
+.ongoing-market-hours { font-size: .75rem; margin-left: auto; }
+.ongoing-market-hours.active { color: var(--green); }
+.ongoing-market-hours.muted  { color: var(--muted); }
+
 /* channels */
 .channels-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 22px; }
 .channel-row {

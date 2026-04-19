@@ -13,6 +13,12 @@ from datetime import date, datetime as _dt, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _PACIFIC = _ZoneInfo("America/Los_Angeles")
+except Exception:
+    _PACIFIC = None   # fallback: no timezone restriction
+
 import httpx
 import numpy as np
 import openai as _openai
@@ -65,6 +71,21 @@ class _State:
         self.underlying_prices = prices
         self._csv_avgo = prices.get("AVGO", 371.55)
 
+    def load_csv_content(self, content: str):
+        """Load portfolio from a CSV string (writes to a temp file, then deletes it)."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(content)
+            tmp = f.name
+        try:
+            self.load_csv(tmp)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
     @property
     def avgo_price(self) -> float:
         """Effective AVGO price: live if enabled, else CSV."""
@@ -87,13 +108,23 @@ _ai_cache: Dict[str, Any] = {
 # ── alert idempotency ──────────────────────────────────────────────────────────
 _alert_sent: set = set()
 
-# ── Fidelity sync state ────────────────────────────────────────────────────────
+# ── Fidelity one-time sync state ──────────────────────────────────────────────
 _sync_state: Dict[str, Any] = {
     "status":     "idle",   # idle | running | done | error
     "last_sync":  None,     # unix timestamp
     "last_error": None,
     "message":    None,
 }
+
+# ── Fidelity ongoing sync state ────────────────────────────────────────────────
+_ongoing_state: Dict[str, Any] = {
+    "enabled":       False,
+    "interval_mins": 5,
+    "status":        "idle",   # idle | running | done | error
+    "last_sync":     None,
+    "last_error":    None,
+}
+_ongoing_task: Optional[asyncio.Task] = None
 
 # ── notification settings ──────────────────────────────────────────────────────
 _settings: Dict[str, Any] = {
@@ -107,9 +138,12 @@ _event_log: List[Dict] = []
 _MAX_LOG = 500
 
 def _log(type_: str, message: str) -> None:
+    # Sync logs: sweep all previous sync entries so only 1 remains at a time
+    if type_ == "sync":
+        _event_log[:] = [e for e in _event_log if e["type"] != "sync"]
     _event_log.insert(0, {
         "time":    _dt.utcnow().isoformat(timespec="seconds") + "Z",
-        "type":    type_,    # csv_load | alert | warning | test | error
+        "type":    type_,    # csv_load | alert | warning | test | error | sync
         "message": message,
     })
     if len(_event_log) > _MAX_LOG:
@@ -359,62 +393,76 @@ async def _send_tg(msg: str):
         pass
 
 
+def _is_market_hours() -> bool:
+    """True if current Pacific time is Mon–Fri, 06:00–13:00."""
+    if _PACIFIC is None:
+        return True   # no zoneinfo: always allow
+    now = _dt.now(_PACIFIC)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    return 6 <= now.hour < 13
+
+
+async def _check_alerts_once() -> None:
+    """Single-pass alert check. Called by both the periodic loop and ongoing sync."""
+    today_str = _today().isoformat()
+    enriched  = _enrich_options()
+    warn_pct  = _settings["warning_pct"]
+    alert_pct = _settings["alert_pct"]
+
+    # 1. Contract gain/loss thresholds
+    for o in enriched:
+        pct = o.get("gain_loss_pct")
+        if pct is None:
+            continue
+        abs_pct = abs(pct)
+        label   = "亏损" if pct < 0 else "盈利"
+        acct    = o.get("account", "")
+
+        if abs_pct > alert_pct:
+            key = f"{o['symbol']}:{acct}:alert:{today_str}"
+            if key not in _alert_sent:
+                _alert_sent.add(key)
+                msg = (f"🚨 *期权高风险警报*\n"
+                       f"合约: `{o['description']}`\n"
+                       f"账户: {acct}\n"
+                       f"{label}: *{pct:.1f}%* (超过 {alert_pct:.0f}% 阈值)\n"
+                       f"当前价值: ${o['current_value']:.0f}\n"
+                       f"AVGO: ${_st.avgo_price:.2f}")
+                _log("alert", f"[{acct}] {o['description']} {label} {pct:.1f}%，已发送告警")
+                asyncio.create_task(_send_tg(msg))
+        elif abs_pct > warn_pct:
+            key = f"{o['symbol']}:{acct}:warn:{today_str}"
+            if key not in _alert_sent:
+                _alert_sent.add(key)
+                msg = (f"⚠️ *期权预警*\n"
+                       f"合约: `{o['description']}`\n"
+                       f"账户: {acct}\n"
+                       f"{label}: *{pct:.1f}%* (超过 {warn_pct:.0f}% 阈值)\n"
+                       f"当前价值: ${o['current_value']:.0f}\n"
+                       f"AVGO: ${_st.avgo_price:.2f}")
+                _log("warning", f"[{acct}] {o['description']} {label} {pct:.1f}%，已发送预警")
+                asyncio.create_task(_send_tg(msg))
+
+    # 2. AVGO daily change threshold
+    chg      = _st.change_pct
+    avgo_thr = _settings["avgo_change_pct"]
+    if chg is not None and abs(chg) > avgo_thr:
+        direction = "上涨" if chg > 0 else "下跌"
+        key = f"AVGO:chg:{direction}:{today_str}"
+        if key not in _alert_sent:
+            _alert_sent.add(key)
+            msg = (f"📊 *AVGO 当日大幅{direction}*\n"
+                   f"涨跌幅: *{chg:+.2f}%* (阈值 {avgo_thr:.1f}%)\n"
+                   f"当前价格: ${_st.avgo_price:.2f}")
+            _log("alert", f"AVGO 当日{direction} {chg:+.2f}%，已发送告警")
+            asyncio.create_task(_send_tg(msg))
+
+
 async def _alert_loop():
     while True:
         await asyncio.sleep(ALERT_CHECK_SECS)
-        today_str = _today().isoformat()
-        enriched  = _enrich_options()
-        warn_pct  = _settings["warning_pct"]
-        alert_pct = _settings["alert_pct"]
-
-        # 1. Contract gain/loss thresholds
-        # Key = symbol + account + level + date — unique per contract-account pair per day
-        for o in enriched:
-            pct = o.get("gain_loss_pct")
-            if pct is None:
-                continue
-            abs_pct = abs(pct)
-            label   = "亏损" if pct < 0 else "盈利"
-            acct    = o.get("account", "")
-
-            if abs_pct > alert_pct:
-                key = f"{o['symbol']}:{acct}:alert:{today_str}"
-                if key not in _alert_sent:
-                    _alert_sent.add(key)
-                    msg = (f"🚨 *期权高风险警报*\n"
-                           f"合约: `{o['description']}`\n"
-                           f"账户: {acct}\n"
-                           f"{label}: *{pct:.1f}%* (超过 {alert_pct:.0f}% 阈值)\n"
-                           f"当前价值: ${o['current_value']:.0f}\n"
-                           f"AVGO: ${_st.avgo_price:.2f}")
-                    _log("alert", f"[{acct}] {o['description']} {label} {pct:.1f}%，已发送告警")
-                    asyncio.create_task(_send_tg(msg))
-            elif abs_pct > warn_pct:
-                key = f"{o['symbol']}:{acct}:warn:{today_str}"
-                if key not in _alert_sent:
-                    _alert_sent.add(key)
-                    msg = (f"⚠️ *期权预警*\n"
-                           f"合约: `{o['description']}`\n"
-                           f"账户: {acct}\n"
-                           f"{label}: *{pct:.1f}%* (超过 {warn_pct:.0f}% 阈值)\n"
-                           f"当前价值: ${o['current_value']:.0f}\n"
-                           f"AVGO: ${_st.avgo_price:.2f}")
-                    _log("warning", f"[{acct}] {o['description']} {label} {pct:.1f}%，已发送预警")
-                    asyncio.create_task(_send_tg(msg))
-
-        # 2. AVGO daily change threshold
-        chg      = _st.change_pct
-        avgo_thr = _settings["avgo_change_pct"]
-        if chg is not None and abs(chg) > avgo_thr:
-            direction = "上涨" if chg > 0 else "下跌"
-            key = f"AVGO:chg:{direction}:{today_str}"
-            if key not in _alert_sent:
-                _alert_sent.add(key)
-                msg = (f"📊 *AVGO 当日大幅{direction}*\n"
-                       f"涨跌幅: *{chg:+.2f}%* (阈值 {avgo_thr:.1f}%)\n"
-                       f"当前价格: ${_st.avgo_price:.2f}")
-                _log("alert", f"AVGO 当日{direction} {chg:+.2f}%，已发送告警")
-                asyncio.create_task(_send_tg(msg))
+        await _check_alerts_once()
 
 
 # ── startup ────────────────────────────────────────────────────────────────────
@@ -809,22 +857,19 @@ async def test_notification():
 
 # ── Fidelity sync ──────────────────────────────────────────────────────────────
 
-async def _run_fidelity_sync() -> None:
-    """Background task: invoke fidelity_sync.run_sync and update _sync_state."""
+async def _run_fidelity_sync_once() -> None:
+    """Background task: one-time sync — writes CSV to disk, emits 1 log entry."""
     from fidelity_sync import run_sync as _fid_sync
-
-    def _log_sync(msg: str):
-        # Also echo into app event log so Logs tab shows progress
-        _log("sync", msg)
-
     try:
-        await _fid_sync(output_path=BLOB_CSV, log=_log_sync)
+        await _fid_sync(output_path=BLOB_CSV, log=lambda _: None)  # silent progress
+        n_opts = len(_st.portfolio["options"])
         _sync_state.update({
             "status":     "done",
             "last_sync":  time.time(),
             "message":    f"Downloaded {BLOB_CSV.name}",
             "last_error": None,
         })
+        _log("sync", f"✓ Sync Once — {BLOB_CSV.name}  ({n_opts} options)")
     except Exception as exc:
         err = str(exc)
         _sync_state.update({
@@ -833,17 +878,61 @@ async def _run_fidelity_sync() -> None:
             "last_error": err,
             "message":    None,
         })
-        _log("error", f"Fidelity sync 失败: {err[:120]}")
+        _log("sync", f"✗ Sync Once failed: {err[:120]}")
+
+
+async def _run_ongoing_sync() -> None:
+    """One pass of the ongoing sync — in-memory, no disk write, no AI trigger."""
+    from fidelity_sync import run_sync_memory as _fid_mem
+    _ongoing_state["status"] = "running"
+    try:
+        csv_content = await _fid_mem(headless=True, log=lambda _: None)
+        _st.load_csv_content(csv_content)
+        _ongoing_state.update({
+            "status":     "done",
+            "last_sync":  time.time(),
+            "last_error": None,
+        })
+        n_opts = len(_st.portfolio["options"])
+        ts = _dt.utcnow().strftime("%H:%M UTC")
+        _log("sync", f"✓ Ongoing sync {ts}  ({n_opts} options, in-memory)")
+        # Alert check only — skip AI analysis
+        asyncio.create_task(_check_alerts_once())
+    except Exception as exc:
+        err = str(exc)
+        _ongoing_state.update({
+            "status":     "error",
+            "last_sync":  time.time(),
+            "last_error": err,
+        })
+        _log("sync", f"✗ Ongoing sync failed: {err[:120]}")
+
+
+async def _ongoing_sync_loop() -> None:
+    """Ongoing background loop — respects interval & Mon–Fri 06:00–13:00 PT."""
+    while _ongoing_state["enabled"]:
+        # Sleep for the configured interval, checking every 30 s for disable
+        interval_secs = _ongoing_state["interval_mins"] * 60
+        slept = 0
+        while slept < interval_secs:
+            await asyncio.sleep(min(30, interval_secs - slept))
+            slept += 30
+            if not _ongoing_state["enabled"]:
+                return
+        if not _ongoing_state["enabled"]:
+            break
+        # Only run during Mon–Fri 06:00–13:00 PT
+        if not _is_market_hours():
+            continue
+        await _run_ongoing_sync()
 
 
 @app.post("/api/sync/fidelity")
 async def trigger_fidelity_sync():
-    """Start a background Fidelity portfolio sync. Returns immediately."""
+    """Start a one-time background Fidelity portfolio sync. Returns immediately."""
     if _sync_state["status"] == "running":
-        return {"status": "already_running",
-                "message": "Sync is already in progress."}
+        return {"status": "already_running", "message": "Sync is already in progress."}
 
-    # Quick env-var check before spawning the task
     if not os.environ.get("FIDELITY_USERNAME") or not os.environ.get("FIDELITY_PASSWORD"):
         raise HTTPException(
             status_code=503,
@@ -851,14 +940,13 @@ async def trigger_fidelity_sync():
         )
 
     _sync_state.update({"status": "running", "last_error": None, "message": "Connecting to Fidelity…"})
-    _log("sync", "Fidelity 同步已触发")
-    asyncio.create_task(_run_fidelity_sync())
+    asyncio.create_task(_run_fidelity_sync_once())
     return {"status": "triggered"}
 
 
 @app.get("/api/sync/status")
 def fidelity_sync_status():
-    """Poll the current state of the Fidelity sync."""
+    """Poll the current state of the one-time Fidelity sync."""
     creds_set = bool(os.environ.get("FIDELITY_USERNAME") and os.environ.get("FIDELITY_PASSWORD"))
     totp_set  = bool(os.environ.get("FIDELITY_TOTP_SECRET"))
     return {
@@ -868,6 +956,53 @@ def fidelity_sync_status():
         "creds_configured": creds_set,
         "totp_configured":  totp_set,
     }
+
+
+class OngoingSyncUpdate(BaseModel):
+    enabled:       Optional[bool] = None
+    interval_mins: Optional[int]  = None
+
+
+@app.get("/api/sync/ongoing")
+def get_ongoing_sync():
+    """Return current ongoing sync settings and status."""
+    return {
+        **_ongoing_state,
+        "age_secs":     round(time.time() - _ongoing_state["last_sync"])
+                        if _ongoing_state["last_sync"] else None,
+        "in_market_hours": _is_market_hours(),
+        "creds_configured": bool(
+            os.environ.get("FIDELITY_USERNAME") and os.environ.get("FIDELITY_PASSWORD")
+        ),
+    }
+
+
+@app.post("/api/sync/ongoing")
+async def update_ongoing_sync(body: OngoingSyncUpdate):
+    """Enable/disable ongoing sync or change the interval."""
+    global _ongoing_task
+
+    if body.interval_mins is not None:
+        _ongoing_state["interval_mins"] = max(1, body.interval_mins)
+
+    if body.enabled is not None:
+        prev = _ongoing_state["enabled"]
+        _ongoing_state["enabled"] = body.enabled
+
+        if body.enabled and not prev:
+            # Newly enabled — start the loop
+            if _ongoing_task and not _ongoing_task.done():
+                _ongoing_task.cancel()
+            _ongoing_task = asyncio.create_task(_ongoing_sync_loop())
+            _log("setting", f"Ongoing sync 已开启  (间隔 {_ongoing_state['interval_mins']} 分钟，交易时段 Mon–Fri 06:00–13:00 PT)")
+        elif not body.enabled and prev:
+            # Disabled — the loop will exit naturally on its next 30 s check
+            if _ongoing_task and not _ongoing_task.done():
+                _ongoing_task.cancel()
+            _ongoing_state["status"] = "idle"
+            _log("setting", "Ongoing sync 已关闭")
+
+    return {**_ongoing_state, "in_market_hours": _is_market_hours()}
 
 
 # ── static ─────────────────────────────────────────────────────────────────────

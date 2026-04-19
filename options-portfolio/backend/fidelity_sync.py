@@ -175,6 +175,26 @@ def _do_sync(output_path: Path, headless: bool, log) -> None:
 
 # ── public async API ───────────────────────────────────────────────────────────
 
+def _do_sync_to_memory(headless: bool, log) -> str:
+    """Run sync and return CSV content as string (temp file, deleted after read)."""
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+        tmp_path = Path(f.name)
+    try:
+        _do_sync(tmp_path, headless, log)
+        return tmp_path.read_text(encoding="utf-8-sig")
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+async def run_sync_memory(headless: bool = True, log=print) -> str:
+    """Async: run Fidelity sync and return CSV as string (no persistent disk file)."""
+    return await asyncio.to_thread(_do_sync_to_memory, headless, log)
+
+
 async def run_sync(
     output_path: Path,
     headless: bool = True,
