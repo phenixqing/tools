@@ -1,4 +1,5 @@
 """Parse Fidelity portfolio CSV into structured position data."""
+import io
 import re
 import csv
 from datetime import date
@@ -50,59 +51,42 @@ def _parse_option_symbol(raw_symbol: str) -> Optional[dict]:
     }
 
 
-# ── main parser ───────────────────────────────────────────────────────────────
+# ── shared parse logic ────────────────────────────────────────────────────────
 
 # Symbols that are clearly money-market / ETF / stock (not options)
 _NON_OPTION_SYMS = {"FZFXX**", "FZDXX", "FDRXX**", "AVGO", "VOO", "SPY",
                     "NHFSMKX98", "Pending activity"}
 
 
-def load_portfolio(csv_path: str) -> dict:
-    """Return {'options': [...], 'stocks': [...], 'cash': [...]}."""
+def _parse_rows(reader) -> dict:
+    """Core parsing logic shared by load_portfolio() and load_portfolio_from_string()."""
     options, stocks, cash = [], [], []
 
-    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            raw_sym = row.get("Symbol", "")
-            if not raw_sym or raw_sym.strip() in ("", "nan"):
-                continue
-            sym_clean = raw_sym.strip()
+    for row in reader:
+        raw_sym = row.get("Symbol", "")
+        if not raw_sym or raw_sym.strip() in ("", "nan"):
+            continue
+        sym_clean = raw_sym.strip()
 
-            # Stop at Fidelity disclaimer lines (they start with a quote block)
-            desc = row.get("Description", "").strip()
-            if "Brokerage services" in desc or "data and information" in desc.lower():
-                break
+        # Stop at Fidelity disclaimer lines (they start with a quote block)
+        desc = row.get("Description", "").strip()
+        if "Brokerage services" in desc or "data and information" in desc.lower():
+            break
 
-            qty = _clean_num(row.get("Quantity"))
-            market_price = _clean_num(row.get("Last Price"))
-            current_value = _clean_num(row.get("Current Value")) or 0.0
-            cost_basis = _clean_num(row.get("Cost Basis Total"))
-            total_gain_loss = _clean_num(row.get("Total Gain/Loss Dollar"))
-            total_gain_pct  = _clean_num(row.get("Total Gain/Loss Percent"))
-            account = row.get("Account Number", "").strip()
+        qty = _clean_num(row.get("Quantity"))
+        market_price = _clean_num(row.get("Last Price"))
+        current_value = _clean_num(row.get("Current Value")) or 0.0
+        cost_basis = _clean_num(row.get("Cost Basis Total"))
+        total_gain_loss = _clean_num(row.get("Total Gain/Loss Dollar"))
+        total_gain_pct  = _clean_num(row.get("Total Gain/Loss Percent"))
+        account = row.get("Account Number", "").strip()
 
-            # ── Option contract (starts with ' -') ────────────────────────
-            if raw_sym.startswith(" -") or raw_sym.startswith("-"):
-                info = _parse_option_symbol(sym_clean)
-                if info:
-                    options.append({
-                        **info,
-                        "symbol": sym_clean,
-                        "description": desc,
-                        "account": account,
-                        "quantity": qty or 0,
-                        "market_price": market_price or 0.0,
-                        "current_value": current_value,
-                        "cost_basis": cost_basis,
-                        "total_gain_loss": total_gain_loss,
-                        "total_gain_pct":  total_gain_pct,
-                    })
-                continue
-
-            # ── Stock / ETF ───────────────────────────────────────────────
-            if sym_clean in ("AVGO", "VOO", "SPY", "NHFSMKX98"):
-                stocks.append({
+        # ── Option contract (starts with ' -') ────────────────────────
+        if raw_sym.startswith(" -") or raw_sym.startswith("-"):
+            info = _parse_option_symbol(sym_clean)
+            if info:
+                options.append({
+                    **info,
                     "symbol": sym_clean,
                     "description": desc,
                     "account": account,
@@ -110,16 +94,50 @@ def load_portfolio(csv_path: str) -> dict:
                     "market_price": market_price or 0.0,
                     "current_value": current_value,
                     "cost_basis": cost_basis,
+                    "total_gain_loss": total_gain_loss,
+                    "total_gain_pct":  total_gain_pct,
                 })
-                continue
+            continue
 
-            # ── Cash / money-market ────────────────────────────────────────
-            if current_value != 0:
-                cash.append({
-                    "symbol": sym_clean,
-                    "description": desc,
-                    "account": account,
-                    "current_value": current_value,
-                })
+        # ── Stock / ETF ───────────────────────────────────────────────
+        if sym_clean in ("AVGO", "VOO", "SPY", "NHFSMKX98"):
+            stocks.append({
+                "symbol": sym_clean,
+                "description": desc,
+                "account": account,
+                "quantity": qty or 0,
+                "market_price": market_price or 0.0,
+                "current_value": current_value,
+                "cost_basis": cost_basis,
+            })
+            continue
+
+        # ── Cash / money-market ────────────────────────────────────────
+        if current_value != 0:
+            cash.append({
+                "symbol": sym_clean,
+                "description": desc,
+                "account": account,
+                "current_value": current_value,
+            })
 
     return {"options": options, "stocks": stocks, "cash": cash}
+
+
+# ── main parser ───────────────────────────────────────────────────────────────
+
+def load_portfolio(csv_path: str) -> dict:
+    """Return {'options': [...], 'stocks': [...], 'cash': [...]} from a CSV file."""
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        return _parse_rows(reader)
+
+
+def load_portfolio_from_string(content: str) -> dict:
+    """
+    Return {'options': [...], 'stocks': [...], 'cash': [...]} from a CSV string.
+    Zero disk I/O — processes the content entirely in memory via io.StringIO.
+    """
+    fh = io.StringIO(content)
+    reader = csv.DictReader(fh)
+    return _parse_rows(reader)

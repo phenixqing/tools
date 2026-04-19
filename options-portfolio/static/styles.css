@@ -47,8 +47,8 @@ header .subtitle { font-size: .74rem; color: var(--muted); margin-top: 1px; }
 .live-toggle-label input { display: none; }
 .live-toggle-track { position: relative; width: 32px; height: 17px; background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; transition: background .2s; flex-shrink: 0; }
 .live-toggle-track .live-dot { position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--muted); transition: transform .2s, background .2s; }
-input#live-price-toggle:checked ~ .live-toggle-track { background: rgba(99,102,241,.25); border-color: var(--accent); }
-input#live-price-toggle:checked ~ .live-toggle-track .live-dot { background: var(--accent); transform: translateX(15px); }
+.live-toggle-label input:checked ~ .live-toggle-track { background: rgba(99,102,241,.25); border-color: var(--accent); }
+.live-toggle-label input:checked ~ .live-toggle-track .live-dot { background: var(--accent); transform: translateX(15px); }
 input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
 .live-price-val { font-size: .82rem; font-weight: 600; color: var(--green); letter-spacing: .3px; }
 .live-price-val.down { color: var(--red); }
@@ -65,50 +65,75 @@ input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
   letter-spacing: .5px;
 }
 
-/* ── Fidelity sync button ────────────────────────────────── */
-.sync-btn-wrap { display: flex; align-items: center; gap: 6px; }
-.sync-btn { display: flex; align-items: center; gap: 5px; }
-.sync-btn.sync-running { opacity: .65; cursor: not-allowed; }
-.sync-btn.sync-unconfigured { opacity: .5; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.sync-btn.sync-running .sync-icon { display: inline-block; animation: spin 1s linear infinite; }
-
-.sync-label {
-  font-size: .72rem;
+/* ── Data source bar (Portfolio tab) ─────────────────────── */
+.data-source-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.data-source-label {
+  font-size: .65rem;
+  font-weight: 700;
+  letter-spacing: .9px;
+  text-transform: uppercase;
   color: var(--muted);
-  max-width: 160px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sync-label.running { color: var(--accent-lt); }
-.sync-label.done    { color: var(--green); }
-.sync-label.error   { color: var(--red); cursor: help; }
+.data-source-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+}
 
-/* ── Upload inline button (in header) ───────────────────── */
-.upload-inline-btn {
+/* ── Data source option buttons (radio-style) ────────────── */
+.ds-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   background: var(--surface2);
   border: 1px solid var(--border);
-  color: var(--text);
+  color: var(--muted);
   border-radius: 6px;
   padding: 5px 13px;
   font-size: .78rem;
   font-weight: 500;
+  font-family: inherit;
   cursor: pointer;
-  transition: border-color .2s, background .2s;
+  transition: border-color .18s, background .18s, color .18s;
   white-space: nowrap;
 }
-.upload-inline-btn:hover { border-color: var(--accent); background: rgba(99,102,241,.12); }
+.ds-option:hover:not(:disabled) { border-color: var(--accent-lt); color: var(--text); }
+.ds-option.active {
+  border-color: var(--accent);
+  background: rgba(99,102,241,.15);
+  color: var(--accent-lt);
+}
+.ds-option.ds-running { opacity: .65; cursor: not-allowed; }
+.ds-option.active .sync-icon { display: inline-block; }
+.ds-option.ds-running .sync-icon { animation: spin 1s linear infinite; }
 
-#upload-status {
-  font-size: .74rem;
-  color: var(--green);
-  max-width: 200px;
+/* Status text next to the active button */
+.ds-status {
+  font-size: .72rem;
+  color: var(--muted);
+  max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
 }
-#upload-status.error { color: var(--red); }
+.ds-status.running { color: var(--accent-lt); }
+.ds-status.done    { color: var(--green); }
+.ds-status.error   { color: var(--red); cursor: help; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── Upload drop zone ────────────────────────────────────── */
 .upload-zone {
@@ -672,6 +697,44 @@ td input[type=checkbox] { margin: 0; }
 }
 .settings-save-msg.visible { opacity: 1; }
 
+/* ongoing sync status row */
+.setting-unit-select {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: .8rem;
+  cursor: pointer;
+}
+
+.ongoing-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 4px;
+  font-size: .8rem;
+}
+.ongoing-status-label { color: var(--muted); }
+.ongoing-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: .75rem;
+  font-weight: 600;
+  background: var(--card);
+  color: var(--muted);
+}
+.ongoing-badge.running { background: rgba(99,102,241,.2); color: var(--accent-lt); }
+.ongoing-badge.done    { background: rgba(72,199,142,.15); color: var(--green); }
+.ongoing-badge.error   { background: rgba(252,129,74,.15); color: var(--red); cursor: help; }
+.ongoing-badge.waiting { background: rgba(99,102,241,.1); color: var(--accent-lt); }
+.ongoing-badge.off     { background: var(--card); color: var(--muted); }
+.ongoing-last-sync { color: var(--muted); font-size: .75rem; }
+.ongoing-market-hours { font-size: .75rem; margin-left: auto; }
+.ongoing-market-hours.active { color: var(--green); }
+.ongoing-market-hours.muted  { color: var(--muted); }
+
 /* channels */
 .channels-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 22px; }
 .channel-row {
@@ -797,3 +860,86 @@ td input[type=checkbox] { margin: 0; }
 .log-badge.error    { background: rgba(239,68,68,.15);  color: var(--red);       border: 1px solid rgba(239,68,68,.25); }
 .log-badge.sync     { background: rgba(34,211,238,.12); color: #67e8f9;          border: 1px solid rgba(34,211,238,.25); }
 .log-msg { color: var(--text); flex: 1; line-height: 1.5; }
+
+/* ── Logs sub-navigation ─────────────────────────────────── */
+.logs-sub-nav {
+  display: flex;
+  gap: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px;
+}
+.log-tab-btn {
+  background: none;
+  border: none;
+  border-radius: 5px;
+  color: var(--muted);
+  padding: 4px 13px;
+  font-size: .76rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .14s, color .14s;
+  white-space: nowrap;
+}
+.log-tab-btn:hover { color: var(--text); }
+.log-tab-btn.active { background: var(--accent); color: #fff; }
+
+/* Panel show/hide */
+.log-panel { display: none; }
+.log-panel.active { display: block; }
+.logs-panel-subtitle {
+  font-size: .73rem;
+  color: var(--muted);
+  padding: 7px 18px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Debug log entries ───────────────────────────────────── */
+.debug-logs-list { font-family: "SF Mono", "Fira Code", monospace; }
+.debug-log-entry {
+  padding: 4px 18px;
+  border-bottom: 1px solid rgba(46,50,80,.5);
+  font-size: .72rem;
+  line-height: 1.55;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  transition: background .1s;
+}
+.debug-log-entry:last-child { border-bottom: none; }
+.debug-log-entry:hover { background: var(--surface2); }
+
+.debug-log-entry .dl-time {
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-size: .68rem;
+  font-variant-numeric: tabular-nums;
+}
+.debug-log-entry .dl-level {
+  font-weight: 700;
+  font-size: .65rem;
+  letter-spacing: .5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 38px;
+}
+.debug-log-entry .dl-msg { flex: 1; word-break: break-all; }
+
+.dl-level.DEBUG { color: #64748b; }
+.dl-level.INFO  { color: var(--accent-lt); }
+.dl-level.WARN  { color: var(--yellow); }
+.dl-level.ERROR { color: var(--red); }
+
+.debug-log-meta {
+  font-size: .68rem;
+  color: var(--muted);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+}

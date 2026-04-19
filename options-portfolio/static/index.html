@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"/>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=10"/>
+  <link rel="stylesheet" href="/static/styles.css?v=13"/>
 </head>
 <body>
 
@@ -28,17 +28,6 @@
       </label>
       <span id="live-price-display" class="live-price-val" style="display:none"></span>
     </div>
-    <div class="sync-btn-wrap">
-      <button id="fidelity-sync-btn" class="upload-inline-btn sync-btn" title="Pull latest portfolio directly from Fidelity">
-        <span class="sync-icon">↻</span> Sync Fidelity
-      </button>
-      <span id="sync-status-label"></span>
-    </div>
-    <div class="upload-btn-wrap">
-      <label class="upload-inline-btn" for="csv-file-input">⬆ Upload CSV</label>
-      <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
-      <span id="upload-status"></span>
-    </div>
   </div>
 </header>
 
@@ -52,7 +41,21 @@
 <!-- ═══════════════════════════════════════════════ TAB: PORTFOLIO -->
 <div id="tab-portfolio" class="tab-panel active">
 <main>
-  <!-- Upload drop zone (visible when no file loaded) -->
+  <!-- Data source bar (radio-style exclusive selection) -->
+  <div class="data-source-bar">
+    <span class="data-source-label">Data Source</span>
+    <div class="data-source-sep"></div>
+    <button id="ds-fidelity" class="ds-option active" title="Pull latest portfolio directly from Fidelity">
+      <span class="sync-icon">↻</span> Sync Fidelity
+    </button>
+    <button id="ds-upload" class="ds-option" title="Upload a Fidelity CSV export">
+      ⬆ Upload CSV
+    </button>
+    <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
+    <span id="ds-status" class="ds-status"></span>
+  </div>
+
+  <!-- Upload drop zone (hidden; drag & drop still supported) -->
   <div id="upload-zone" class="upload-zone" style="display:none">
     <div class="upload-icon">📂</div>
     <div class="upload-text">Drop a Fidelity portfolio CSV here, or <label for="csv-file-input" class="upload-link">click to browse</label></div>
@@ -280,6 +283,68 @@
   </div>
 
   <div class="settings-card">
+    <h2 class="settings-card-title">🔄 Fidelity Sync</h2>
+    <p class="settings-card-desc">Ongoing sync is controlled by the <b>Sync Fidelity</b> source selection in the Portfolio tab. Use <em>Sync Now</em> for a one-off immediate pull. All syncs run in-memory — no disk write, AI analysis skipped.</p>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon">↻</span>
+        <div>
+          <div class="setting-name">Sync Now</div>
+          <div class="setting-hint">Immediately pull latest positions from Fidelity (in-memory)</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <button id="sync-now-btn" class="btn-accent">↻ Sync Now</button>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon">🕐</span>
+        <div>
+          <div class="setting-name">Allow sync outside market hours</div>
+          <div class="setting-hint">Debug: bypass Mon–Fri 06:00–13:00 PT restriction</div>
+        </div>
+      </div>
+      <label class="live-toggle-label">
+        <input type="checkbox" id="allow-anytime-toggle"/>
+        <span class="live-toggle-track"><span class="live-dot"></span></span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon">⏲</span>
+        <div>
+          <div class="setting-name">Sync interval</div>
+          <div class="setting-hint">How often to pull from Fidelity (min 30 s)</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <input type="number" id="ongoing-interval" class="setting-input" min="1" step="1" value="5"/>
+        <select id="ongoing-unit" class="setting-unit-select">
+          <option value="min" selected>min</option>
+          <option value="sec">sec</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="ongoing-status-row">
+      <span class="ongoing-status-label">Status:</span>
+      <span id="ongoing-status-badge" class="ongoing-badge">—</span>
+      <span id="ongoing-last-sync" class="ongoing-last-sync"></span>
+      <span id="ongoing-market-hours" class="ongoing-market-hours"></span>
+    </div>
+
+    <div class="settings-actions">
+      <span id="sync-now-msg" class="settings-save-msg"></span>
+      <button id="save-ongoing-btn" class="btn-accent">💾 Save</button>
+      <span id="ongoing-save-msg" class="settings-save-msg"></span>
+    </div>
+  </div>
+
+  <div class="settings-card">
     <h2 class="settings-card-title">📡 Notification Channels</h2>
     <p class="settings-card-desc">Configured delivery channels for alerts and warnings.</p>
 
@@ -307,16 +372,35 @@
 <div id="tab-logs" class="tab-panel">
 <div class="logs-wrap">
   <div class="logs-toolbar">
-    <h2 class="logs-title">Event Log</h2>
-    <span class="logs-subtitle">CSV loads · alerts · threshold changes — newest first</span>
+    <h2 class="logs-title">Logs</h2>
+    <div class="logs-sub-nav">
+      <button id="log-tab-events" class="log-tab-btn active">📋 Event Log</button>
+      <button id="log-tab-debug"  class="log-tab-btn">🔍 Debug Log</button>
+    </div>
     <button id="refresh-logs-btn" class="logs-refresh-btn">↻ Refresh</button>
   </div>
-  <div id="logs-list" class="logs-list">
-    <div class="logs-empty">Loading…</div>
+
+  <!-- Event Log panel -->
+  <div id="log-panel-events" class="log-panel active">
+    <div class="logs-panel-subtitle">CSV loads · alerts · threshold changes — newest first</div>
+    <div id="logs-list" class="logs-list">
+      <div class="logs-empty">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Debug Log panel -->
+  <div id="log-panel-debug" class="log-panel">
+    <div class="logs-panel-subtitle">
+      Persistent trace &amp; error log · kept 7 days · up to 1 MB
+      <span id="debug-log-meta" class="debug-log-meta"></span>
+    </div>
+    <div id="debug-logs-list" class="logs-list debug-logs-list">
+      <div class="logs-empty">Select "Debug Log" to load…</div>
+    </div>
   </div>
 </div>
 </div><!-- /tab-logs -->
 
-<script src="/static/app.js?v=10"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>
