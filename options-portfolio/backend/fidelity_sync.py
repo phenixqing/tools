@@ -386,37 +386,66 @@ def _extract_positions_from_page(page, log) -> str:
 
 class FidelitySession:
     """
-    Keeps a FidelityAutomation browser alive across multiple syncs so that
-    each subsequent download only navigates to the positions page and clicks
-    Download — no repeated login.
+    Keeps a raw Playwright browser session alive across multiple Fidelity syncs.
 
-    On session expiry (redirect to login page) the session re-logins
-    automatically.  A threading.Lock ensures only one download at a time.
+    Uses playwright + playwright_stealth directly — does NOT call
+    fidelity.FidelityAutomation.login(), which breaks whenever Fidelity's
+    post-auth redirect URL differs from the hardcoded /portfolio/summary check
+    in that library.
+
+    On session expiry the session re-logins automatically.
+    A threading.Lock ensures only one operation runs at a time.
     """
 
+    # Fidelity loading-spinner selectors (mirrors FidelityAutomation.wait_for_loading_sign)
+    _LOADING_SIGNS = [
+        "div:nth-child(2) > .loading-spinner-mask-after",
+        ".pvd-spinner__mask-inner",
+        "pvd-loading-spinner",
+        ".pvd3-spinner-root > .pvd-spinner__spinner > .pvd-spinner__visual > div > .pvd-spinner__mask-inner",
+    ]
+
     def __init__(self) -> None:
-        self._browser = None          # FidelityAutomation instance or None
+        self._pw      = None   # sync_playwright() instance
+        self._browser = None   # playwright Browser
+        self._context = None   # playwright BrowserContext
+        self._page    = None   # playwright Page
         self._lock    = threading.Lock()
 
     # ── internal ────────────────────────────────────────────────────────────
 
     def _is_alive(self) -> bool:
-        """Return True if the existing browser looks usable."""
-        if self._browser is None:
+        """Return True if the existing page looks usable."""
+        if self._page is None:
             return False
         try:
-            url = self._browser.page.url.lower()
-            # Consider alive if NOT on any login/error page
+            url = self._page.url.lower()
             return "signin" not in url and "login" not in url and "error" not in url
         except Exception:
             return False
 
+    def _wait_for_loading(self, timeout: int = 30_000) -> None:
+        """Wait for all known Fidelity loading spinners to disappear."""
+        for sel in self._LOADING_SIGNS:
+            try:
+                self._page.locator(sel).first.wait_for(timeout=timeout, state="hidden")
+            except Exception:
+                pass
+
     def _login(self, headless: bool, log) -> None:
-        """Create a fresh browser and log in."""
+        """
+        Create a fresh Playwright Firefox browser and log in to Fidelity.
+
+        Uses FIDELITY_USERNAME / FIDELITY_PASSWORD / FIDELITY_TOTP_SECRET.
+        Does NOT rely on FidelityAutomation.login() — implements the login
+        flow directly so it works regardless of which post-auth URL Fidelity
+        redirects to.
+        """
+        from playwright.sync_api import sync_playwright, TimeoutError as _PwTimeout
         try:
-            from fidelity import fidelity as fid_lib
+            from playwright_stealth import stealth_sync as _stealth
         except ImportError:
-            raise RuntimeError("The `fidelity` library is required: pip install fidelity")
+            _stealth = None
 
         username    = os.environ.get("FIDELITY_USERNAME", "").strip()
         password    = os.environ.get("FIDELITY_PASSWORD", "").strip()
@@ -429,54 +458,157 @@ class FidelitySession:
 
         _headless = headless and os.environ.get("FIDELITY_HEADLESS", "1") != "0"
         log(f"Starting new Fidelity session ({'headless' if _headless else 'visible'})…")
+        _dbg.debug(f"_login: headless={_headless}, totp={'set' if totp_secret else 'not set'}")
 
-        browser = fid_lib.FidelityAutomation(headless=_headless, save_state=False)
-        step1, step2 = browser.login(
-            username=username,
-            password=password,
-            totp_secret=totp_secret,
-            save_device=True,
-        )
-
-        if not step1:
-            browser.close_browser()
-            raise RuntimeError(
-                "Fidelity login failed — check FIDELITY_USERNAME and FIDELITY_PASSWORD."
+        pw = sync_playwright().start()
+        try:
+            browser = pw.firefox.launch(
+                headless=_headless,
+                args=["--disable-webgl", "--disable-software-rasterizer"],
             )
-        if not step2:
-            browser.close_browser()
-            if totp_secret:
+            context = browser.new_context()
+            page    = context.new_page()
+
+            if _stealth:
+                _stealth(page)
+
+            # ── navigate to login ────────────────────────────────────────────
+            log("Navigating to Fidelity login page…")
+            page.goto(
+                "https://digital.fidelity.com/prgw/digital/login/full-page",
+                timeout=60_000,
+            )
+
+            # ── fill credentials ─────────────────────────────────────────────
+            page.get_by_label("Username", exact=True).click()
+            page.get_by_label("Username", exact=True).fill(username)
+            page.get_by_label("Password", exact=True).click()
+            page.get_by_label("Password", exact=True).fill(password)
+            page.get_by_role("button", name="Log in").click()
+            _dbg.debug("_login: credentials submitted")
+
+            # ── wait for initial spinner (twice, same as fidelity lib) ───────
+            page.wait_for_timeout(1_000)
+            for sel in self._LOADING_SIGNS:
+                try:
+                    page.locator(sel).first.wait_for(timeout=30_000, state="hidden")
+                except Exception:
+                    pass
+            page.wait_for_timeout(1_000)
+            for sel in self._LOADING_SIGNS:
+                try:
+                    page.locator(sel).first.wait_for(timeout=30_000, state="hidden")
+                except Exception:
+                    pass
+
+            url = page.url.lower()
+            _dbg.debug(f"_login: post-submit URL={url!r}")
+
+            # ── TOTP / 2FA handling ──────────────────────────────────────────
+            _on_auth_page = any(kw in url for kw in ("login", "auth", "2fa", "mfa", "verify", "signin"))
+            if _on_auth_page:
+                _dbg.debug("_login: on 2FA page — attempting TOTP")
+                if totp_secret:
+                    import pyotp as _pyotp
+                    try:
+                        page.get_by_placeholder("XXXXXX").wait_for(timeout=10_000, state="visible")
+                        code = _pyotp.TOTP(totp_secret).now()
+                        _dbg.debug(f"_login: submitting TOTP code (len={len(code)})")
+                        page.get_by_placeholder("XXXXXX").click()
+                        page.get_by_placeholder("XXXXXX").fill(code)
+                        # Best-effort: check "Don't ask me again" box
+                        try:
+                            lbl = page.locator("label").filter(has_text="Don't ask me again on this")
+                            if lbl.is_visible(timeout=2_000):
+                                lbl.check()
+                        except Exception:
+                            pass
+                        page.get_by_role("button", name="Continue").click()
+                        _dbg.debug("_login: TOTP submitted")
+                    except _PwTimeout:
+                        _dbg.warning(
+                            f"_login: TOTP input not found on 2FA page — "
+                            f"URL={page.url!r}. Continuing anyway."
+                        )
+                        try:
+                            page.screenshot(path="/tmp/fidelity_2fa_unknown.png")
+                            _dbg.warning("2FA screenshot → /tmp/fidelity_2fa_unknown.png")
+                        except Exception:
+                            pass
+
+                # Wait for spinner to clear after 2FA submission
+                page.wait_for_timeout(1_000)
+                for sel in self._LOADING_SIGNS:
+                    try:
+                        page.locator(sel).first.wait_for(timeout=30_000, state="hidden")
+                    except Exception:
+                        pass
+
+            # ── wait until we're fully off the auth flow ─────────────────────
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                url = page.url.lower()
+                if not any(kw in url for kw in ("login", "auth", "signin", "2fa", "mfa", "verify")):
+                    break
+                time.sleep(2)
+
+            url = page.url.lower()
+            _dbg.debug(f"_login: final URL={url!r}")
+            if any(kw in url for kw in ("login", "signin")):
+                try:
+                    page.screenshot(path="/tmp/fidelity_login_failed.png")
+                    _dbg.error("Login failed — screenshot → /tmp/fidelity_login_failed.png")
+                except Exception:
+                    pass
                 raise RuntimeError(
-                    "Fidelity 2FA failed — check FIDELITY_TOTP_SECRET."
+                    "Fidelity login did not complete — still on login page after 60 s. "
+                    "Check FIDELITY_USERNAME, FIDELITY_PASSWORD, and FIDELITY_TOTP_SECRET."
                 )
-            raise RuntimeError(
-                "Fidelity requires 2FA but FIDELITY_TOTP_SECRET is not set."
-            )
 
-        self._browser = browser
-        log("Fidelity session established.")
+            self._pw      = pw
+            self._browser = browser
+            self._context = context
+            self._page    = page
+            log("Fidelity session established.")
+            _dbg.info(f"_login: session established, URL={page.url!r}")
 
-    def _close_browser(self) -> None:
-        """Close and discard the current browser (best-effort)."""
-        if self._browser is not None:
+        except Exception:
+            # Clean up playwright on any failure so resources aren't leaked
             try:
-                self._browser.close_browser()
+                pw.stop()
             except Exception:
                 pass
-            self._browser = None
+            raise
+
+    def _close_browser(self) -> None:
+        """Close and discard the current session (best-effort)."""
+        for attr in ("_page", "_context", "_browser"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
 
     def _navigate_to_positions(self, log) -> None:
         """Navigate to the portfolio positions page and wait for it to fully load."""
         log("Navigating to Portfolio Positions page…")
         _dbg.debug("FidelitySession: navigating to positions page")
-        self._browser.page.goto(
+        self._page.goto(
             "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
         )
-        self._browser.wait_for_loading_sign()
-        self._browser.page.wait_for_timeout(1_500)
-        self._browser.wait_for_loading_sign(timeout=int(2.5 * 60 * 1_000))
+        self._wait_for_loading()
+        self._page.wait_for_timeout(1_500)
+        self._wait_for_loading(timeout=int(2.5 * 60 * 1_000))
 
-        url = self._browser.page.url.lower()
+        url = self._page.url.lower()
         _dbg.debug(f"FidelitySession: positions page loaded, url={url!r}")
         if "signin" in url or "login" in url:
             _dbg.error(f"FidelitySession: redirected to login page — session expired. url={url!r}")
@@ -485,20 +617,20 @@ class FidelitySession:
     def _extract_from_page(self, log) -> str:
         """Navigate to positions page and extract CSV data via DOM scraping."""
         self._navigate_to_positions(log)
-        return _extract_positions_from_page(self._browser.page, log)
+        return _extract_positions_from_page(self._page, log)
 
     def _download_to_path(self, output_path: Path, log) -> None:
         """Navigate to positions page and download CSV (session must already be live)."""
         log("Navigating to Portfolio Positions page…")
-        self._browser.page.goto(
+        self._page.goto(
             "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
         )
-        self._browser.wait_for_loading_sign()
-        self._browser.page.wait_for_timeout(1_000)
-        self._browser.wait_for_loading_sign(timeout=int(2.5 * 60 * 1_000))
+        self._wait_for_loading()
+        self._page.wait_for_timeout(1_000)
+        self._wait_for_loading(timeout=int(2.5 * 60 * 1_000))
 
         # After navigation, verify we're not on a login page
-        url = self._browser.page.url.lower()
+        url = self._page.url.lower()
         if "signin" in url or "login" in url:
             raise RuntimeError("Session expired — redirected to login page.")
 
@@ -508,9 +640,9 @@ class FidelitySession:
 
         # New Fidelity UI: "Available Actions" → "Download"
         try:
-            self._browser.page.get_by_role("button", name="Available Actions").click(timeout=8_000)
-            with self._browser.page.expect_download(timeout=30_000) as dl_info:
-                self._browser.page.get_by_role("menuitem", name="Download").click()
+            self._page.get_by_role("button", name="Available Actions").click(timeout=8_000)
+            with self._page.expect_download(timeout=30_000) as dl_info:
+                self._page.get_by_role("menuitem", name="Download").click()
             dl_info.value.save_as(str(output_path))
             downloaded = True
             log("Downloaded via 'Available Actions' menu.")
@@ -520,8 +652,8 @@ class FidelitySession:
         # Old Fidelity UI: "Download Positions" label/button
         if not downloaded:
             try:
-                with self._browser.page.expect_download(timeout=30_000) as dl_info:
-                    self._browser.page.get_by_label("Download Positions").click(timeout=8_000)
+                with self._page.expect_download(timeout=30_000) as dl_info:
+                    self._page.get_by_label("Download Positions").click(timeout=8_000)
                 dl_info.value.save_as(str(output_path))
                 downloaded = True
                 log("Downloaded via 'Download Positions' button.")
@@ -531,7 +663,7 @@ class FidelitySession:
         if not downloaded:
             try:
                 shot = output_path.parent / "fidelity_error.png"
-                self._browser.page.screenshot(path=str(shot))
+                self._page.screenshot(path=str(shot))
                 log(f"Error screenshot → {shot}")
             except Exception:
                 pass
