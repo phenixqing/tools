@@ -434,18 +434,25 @@ class FidelitySession:
 
     def _login(self, headless: bool, log) -> None:
         """
-        Create a fresh Playwright Firefox browser and log in to Fidelity.
+        Create a fresh Playwright browser and log in to Fidelity.
 
         Uses FIDELITY_USERNAME / FIDELITY_PASSWORD / FIDELITY_TOTP_SECRET.
-        Does NOT rely on FidelityAutomation.login() — implements the login
-        flow directly so it works regardless of which post-auth URL Fidelity
-        redirects to.
+        Uses Chromium with playwright_stealth + human-like typing delays to
+        minimise bot-detection by Fidelity's anti-automation layer.
+        Does NOT rely on FidelityAutomation.login() — implements the full flow
+        so it works regardless of which post-auth URL Fidelity redirects to.
         """
         from playwright.sync_api import sync_playwright, TimeoutError as _PwTimeout
         try:
-            from playwright_stealth import stealth_sync as _stealth
+            from playwright_stealth import StealthConfig, stealth_sync as _stealth_sync
+            _STEALTH_CFG = StealthConfig(
+                navigator_languages=False,
+                navigator_user_agent=False,
+                navigator_vendor=False,
+            )
+            _have_stealth = True
         except ImportError:
-            _stealth = None
+            _have_stealth = False
 
         username    = os.environ.get("FIDELITY_USERNAME", "").strip()
         password    = os.environ.get("FIDELITY_PASSWORD", "").strip()
@@ -462,32 +469,56 @@ class FidelitySession:
 
         pw = sync_playwright().start()
         try:
-            browser = pw.firefox.launch(
+            # Chromium has better stealth support than Firefox
+            browser = pw.chromium.launch(
                 headless=_headless,
-                args=["--disable-webgl", "--disable-software-rasterizer"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             )
-            context = browser.new_context()
-            page    = context.new_page()
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+            )
+            page = context.new_page()
 
-            if _stealth:
-                _stealth(page)
+            if _have_stealth:
+                _stealth_sync(page, _STEALTH_CFG)
 
             # ── navigate to login ────────────────────────────────────────────
             log("Navigating to Fidelity login page…")
             page.goto(
                 "https://digital.fidelity.com/prgw/digital/login/full-page",
                 timeout=60_000,
+                wait_until="domcontentloaded",
             )
+            page.wait_for_timeout(1_500)   # brief pause — looks more human
 
-            # ── fill credentials ─────────────────────────────────────────────
-            page.get_by_label("Username", exact=True).click()
-            page.get_by_label("Username", exact=True).fill(username)
-            page.get_by_label("Password", exact=True).click()
-            page.get_by_label("Password", exact=True).fill(password)
+            _dbg.debug(f"_login: login page loaded, URL={page.url!r}")
+
+            # ── fill credentials with human-like delays ──────────────────────
+            user_field = page.get_by_label("Username", exact=True)
+            user_field.click()
+            page.wait_for_timeout(300)
+            user_field.type(username, delay=80)   # keystroke delay ~80 ms
+
+            pass_field = page.get_by_label("Password", exact=True)
+            pass_field.click()
+            page.wait_for_timeout(200)
+            pass_field.type(password, delay=60)
+
+            page.wait_for_timeout(500)
             page.get_by_role("button", name="Log in").click()
             _dbg.debug("_login: credentials submitted")
 
-            # ── wait for initial spinner (twice, same as fidelity lib) ───────
+            # ── wait for spinners (twice, mirrors FidelityAutomation) ────────
             page.wait_for_timeout(1_000)
             for sel in self._LOADING_SIGNS:
                 try:
@@ -504,18 +535,48 @@ class FidelitySession:
             url = page.url.lower()
             _dbg.debug(f"_login: post-submit URL={url!r}")
 
+            # ── detect and handle "Sorry" / transient error pages ────────────
+            if "sorry" in page.content().lower() or (
+                page.get_by_text("Sorry, we can't complete").is_visible(timeout=1_000)
+                if True else False
+            ):
+                _dbg.warning("_login: Fidelity returned an error page; clicking 'Go back to login'")
+                try:
+                    page.get_by_role("link", name="Go back to login").click(timeout=5_000)
+                    page.wait_for_timeout(2_000)
+                    # Retry credentials once
+                    page.get_by_label("Username", exact=True).click()
+                    page.wait_for_timeout(200)
+                    page.get_by_label("Username", exact=True).type(username, delay=80)
+                    page.get_by_label("Password", exact=True).click()
+                    page.wait_for_timeout(200)
+                    page.get_by_label("Password", exact=True).type(password, delay=60)
+                    page.wait_for_timeout(500)
+                    page.get_by_role("button", name="Log in").click()
+                    page.wait_for_timeout(2_000)
+                    for sel in self._LOADING_SIGNS:
+                        try:
+                            page.locator(sel).first.wait_for(timeout=30_000, state="hidden")
+                        except Exception:
+                            pass
+                    url = page.url.lower()
+                    _dbg.debug(f"_login: retry post-submit URL={url!r}")
+                except Exception as _e:
+                    _dbg.warning(f"_login: error-page retry failed: {_e}")
+
             # ── TOTP / 2FA handling ──────────────────────────────────────────
+            url = page.url.lower()
             _on_auth_page = any(kw in url for kw in ("login", "auth", "2fa", "mfa", "verify", "signin"))
             if _on_auth_page:
-                _dbg.debug("_login: on 2FA page — attempting TOTP")
+                _dbg.debug(f"_login: on 2FA/auth page — attempting TOTP, URL={url!r}")
                 if totp_secret:
                     import pyotp as _pyotp
                     try:
-                        page.get_by_placeholder("XXXXXX").wait_for(timeout=10_000, state="visible")
+                        page.get_by_placeholder("XXXXXX").wait_for(timeout=12_000, state="visible")
                         code = _pyotp.TOTP(totp_secret).now()
-                        _dbg.debug(f"_login: submitting TOTP code (len={len(code)})")
+                        _dbg.debug(f"_login: filling TOTP code (len={len(code)})")
                         page.get_by_placeholder("XXXXXX").click()
-                        page.get_by_placeholder("XXXXXX").fill(code)
+                        page.get_by_placeholder("XXXXXX").type(code, delay=80)
                         # Best-effort: check "Don't ask me again" box
                         try:
                             lbl = page.locator("label").filter(has_text="Don't ask me again on this")
@@ -527,8 +588,8 @@ class FidelitySession:
                         _dbg.debug("_login: TOTP submitted")
                     except _PwTimeout:
                         _dbg.warning(
-                            f"_login: TOTP input not found on 2FA page — "
-                            f"URL={page.url!r}. Continuing anyway."
+                            f"_login: TOTP placeholder not found — "
+                            f"URL={page.url!r}. Saving screenshot and continuing."
                         )
                         try:
                             page.screenshot(path="/tmp/fidelity_2fa_unknown.png")
@@ -536,7 +597,7 @@ class FidelitySession:
                         except Exception:
                             pass
 
-                # Wait for spinner to clear after 2FA submission
+                # Wait for spinners to clear after 2FA
                 page.wait_for_timeout(1_000)
                 for sel in self._LOADING_SIGNS:
                     try:
@@ -544,7 +605,7 @@ class FidelitySession:
                     except Exception:
                         pass
 
-            # ── wait until we're fully off the auth flow ─────────────────────
+            # ── poll until we're fully off auth pages ────────────────────────
             deadline = time.time() + 60
             while time.time() < deadline:
                 url = page.url.lower()
@@ -561,7 +622,7 @@ class FidelitySession:
                 except Exception:
                     pass
                 raise RuntimeError(
-                    "Fidelity login did not complete — still on login page after 60 s. "
+                    "Fidelity login did not complete — still on login/signin page after 60 s. "
                     "Check FIDELITY_USERNAME, FIDELITY_PASSWORD, and FIDELITY_TOTP_SECRET."
                 )
 
@@ -573,7 +634,6 @@ class FidelitySession:
             _dbg.info(f"_login: session established, URL={page.url!r}")
 
         except Exception:
-            # Clean up playwright on any failure so resources aren't leaked
             try:
                 pw.stop()
             except Exception:
