@@ -1,5 +1,9 @@
 """
-Fidelity portfolio CSV downloader — Playwright browser automation.
+Fidelity portfolio CSV downloader.
+
+Uses the `fidelity` Python library for browser automation and login
+(handles TOTP 2FA, loading spinners, device trust automatically),
+then downloads the positions CSV via the authenticated page.
 
 Required env vars
 -----------------
@@ -9,11 +13,9 @@ FIDELITY_PASSWORD      Fidelity password
 Optional env vars
 -----------------
 FIDELITY_TOTP_SECRET   Base32 TOTP secret for fully-automated 2FA.
-                       Get it by setting up a TOTP authenticator (e.g. Google
-                       Authenticator) on your Fidelity account and saving the
-                       "manual entry" key shown during setup.
-FIDELITY_HEADLESS      Set to "0" to show the browser window (useful for
-                       debugging or when bot-detection blocks headless mode).
+                       Obtain by re-enrolling your authenticator app and
+                       copying the "enter key manually" base32 string.
+FIDELITY_HEADLESS      Set to "0" to show the browser window.
 
 Usage
 -----
@@ -33,244 +35,20 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# ── constants ──────────────────────────────────────────────────────────────────
-LOGIN_URL     = "https://digital.fidelity.com/prgw/digital/login/full-page"
-POSITIONS_URL = "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
 
-# Timeout in milliseconds
-PAGE_TIMEOUT  = 60_000   # 60 s — Fidelity SPA can be slow
-NAV_TIMEOUT   = 30_000
+# ── synchronous core ───────────────────────────────────────────────────────────
 
-
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def _totp_code(secret: str) -> str:
+def _do_sync(output_path: Path, headless: bool, log) -> None:
+    """
+    Synchronous implementation — runs the Playwright browser in the current
+    thread (required because the `fidelity` library uses sync_playwright).
+    """
     try:
-        import pyotp
-        return pyotp.TOTP(secret).now()
+        from fidelity import fidelity as fid_lib
     except ImportError:
         raise RuntimeError(
-            "pyotp is required for TOTP 2FA: pip install pyotp"
+            "The `fidelity` library is required: pip install fidelity"
         )
-
-
-async def _try_click(page, *selectors: str, timeout: int = 5_000) -> bool:
-    """Try each selector in order; click the first one found. Returns True on success."""
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=timeout)
-            await loc.click()
-            return True
-        except Exception:
-            continue
-    return False
-
-
-async def _try_fill(page, value: str, *selectors: str, timeout: int = 5_000) -> bool:
-    """Fill the first visible input matching any selector."""
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=timeout)
-            await loc.fill(value)
-            return True
-        except Exception:
-            continue
-    return False
-
-
-# ── login ──────────────────────────────────────────────────────────────────────
-
-async def _login(page, username: str, password: str,
-                 totp_secret: Optional[str], log) -> None:
-    """Navigate to Fidelity login and authenticate, handling optional TOTP 2FA."""
-    log("Navigating to Fidelity login page…")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-
-    # ── username ──────────────────────────────────────────────────────────────
-    log("Entering username…")
-    ok = await _try_fill(page, username,
-                         "#userId-input",
-                         "input[name='username']",
-                         "input[id*='user']",
-                         "input[type='text']")
-    if not ok:
-        raise RuntimeError("Could not find username input field on Fidelity login page.")
-
-    # Some flows show username then password on separate screens
-    await _try_click(page,
-                     "#fs-login-button",
-                     "button[data-testid='continue-button']",
-                     "button:has-text('Continue')",
-                     timeout=3_000)
-    await page.wait_for_timeout(800)
-
-    # ── password ──────────────────────────────────────────────────────────────
-    log("Entering password…")
-    ok = await _try_fill(page, password,
-                         "#password",
-                         "input[name='password']",
-                         "input[type='password']")
-    if not ok:
-        raise RuntimeError("Could not find password input field on Fidelity login page.")
-
-    log("Submitting credentials…")
-    ok = await _try_click(page,
-                          "#fs-login-button",
-                          "button[type='submit']",
-                          "button:has-text('Log in')",
-                          "button:has-text('Sign in')")
-    if not ok:
-        raise RuntimeError("Could not find login submit button.")
-
-    await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
-
-    # ── 2FA detection ─────────────────────────────────────────────────────────
-    page_text = (await page.content()).lower()
-    two_fa_indicators = [
-        "verification code", "security code", "one-time", "authenticator",
-        "otc", "two-factor", "2-step", "enter code",
-    ]
-    needs_2fa = any(k in page_text for k in two_fa_indicators)
-
-    if needs_2fa:
-        log("2FA prompt detected.")
-        if totp_secret:
-            code = _totp_code(totp_secret)
-            log(f"Entering TOTP code ({code[:2]}****) …")
-            ok = await _try_fill(page, code,
-                                 "#otc",
-                                 "input[name='otc']",
-                                 "input[id*='otp']",
-                                 "input[id*='code']",
-                                 "input[placeholder*='code' i]",
-                                 "input[aria-label*='code' i]")
-            if not ok:
-                raise RuntimeError(
-                    "2FA required but could not find the code input field. "
-                    "Try running with FIDELITY_HEADLESS=0 to complete 2FA manually."
-                )
-            await _try_click(page,
-                             "button[type='submit']",
-                             "button:has-text('Submit')",
-                             "button:has-text('Continue')",
-                             "button:has-text('Verify')")
-            await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
-        else:
-            raise RuntimeError(
-                "Fidelity requires 2FA but FIDELITY_TOTP_SECRET is not set.\n"
-                "Options:\n"
-                "  1. Set FIDELITY_TOTP_SECRET to your authenticator's base32 secret.\n"
-                "  2. Run with FIDELITY_HEADLESS=0 to complete 2FA in the browser window."
-            )
-
-    # ── verify logged in ──────────────────────────────────────────────────────
-    current_url = page.url.lower()
-    if "login" in current_url or "error" in current_url:
-        raise RuntimeError(
-            f"Login may have failed — still on: {page.url}\n"
-            "Check credentials or run with FIDELITY_HEADLESS=0 to inspect."
-        )
-    log("Login successful.")
-
-
-# ── download ───────────────────────────────────────────────────────────────────
-
-async def _download_csv(page, output_path: Path, log) -> None:
-    """Navigate to the positions page and download the portfolio CSV."""
-    log("Navigating to Portfolio Positions page…")
-    await page.goto(POSITIONS_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-
-    # Wait for the positions table to render (Fidelity is a heavy SPA)
-    log("Waiting for positions table…")
-    try:
-        await page.wait_for_selector(
-            ".p-positions-table, [data-testid*='position'], "
-            ".ag-root-wrapper, .account-selector-table, "
-            "table",
-            timeout=PAGE_TIMEOUT,
-        )
-    except Exception:
-        raise RuntimeError(
-            "Positions table did not appear within 60 s. "
-            "Try running with FIDELITY_HEADLESS=0 to inspect the page."
-        )
-
-    await page.wait_for_timeout(2000)   # allow lazy columns to populate
-
-    # ── find & click the Download button ─────────────────────────────────────
-    log("Looking for Download button…")
-
-    # Fidelity sometimes hides the download behind a "..." or toolbar button
-    download_selectors = [
-        "button:has-text('Download')",
-        "a:has-text('Download')",
-        "[aria-label*='download' i]",
-        "[title*='download' i]",
-        "[data-testid*='download']",
-        "button.download-btn",
-        # older Fidelity UI
-        "a[href*='download' i]",
-        "a[href*='csv' i]",
-    ]
-
-    # Try each selector; some might be inside a dropdown — open it first
-    async def _attempt_download():
-        for sel in download_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=3_000):
-                    async with page.expect_download(timeout=30_000) as dl_info:
-                        await loc.click()
-                    return await dl_info.value
-            except Exception:
-                continue
-        return None
-
-    dl = await _attempt_download()
-
-    # If direct click didn't work, try opening a "..." / actions menu first
-    if dl is None:
-        log("Direct download button not found — trying actions menu…")
-        menu_opened = await _try_click(page,
-                                       "button[aria-label*='more' i]",
-                                       "button[aria-label*='action' i]",
-                                       "button:has-text('...')",
-                                       "button[aria-haspopup='menu']",
-                                       timeout=5_000)
-        if menu_opened:
-            await page.wait_for_timeout(500)
-            dl = await _attempt_download()
-
-    if dl is None:
-        raise RuntimeError(
-            "Could not find a Download button on the Positions page.\n"
-            "Fidelity may have updated its UI. "
-            "Run with FIDELITY_HEADLESS=0 to manually locate the button."
-        )
-
-    # ── save ──────────────────────────────────────────────────────────────────
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    await dl.save_as(str(output_path))
-    log(f"Saved → {output_path}  ({output_path.stat().st_size:,} bytes)")
-
-
-# ── public API ─────────────────────────────────────────────────────────────────
-
-async def run_sync(
-    output_path: Path,
-    headless: bool = True,
-    log=print,
-) -> None:
-    """
-    Full sync: login to Fidelity → download positions CSV → save to output_path.
-
-    Reads credentials from environment variables:
-      FIDELITY_USERNAME, FIDELITY_PASSWORD, FIDELITY_TOTP_SECRET (optional)
-    """
-    from playwright.async_api import async_playwright
 
     username    = os.environ.get("FIDELITY_USERNAME", "").strip()
     password    = os.environ.get("FIDELITY_PASSWORD", "").strip()
@@ -282,50 +60,136 @@ async def run_sync(
         )
 
     _headless = headless and os.environ.get("FIDELITY_HEADLESS", "1") != "0"
-    log(f"Launching {'headless' if _headless else 'visible'} browser…")
+    log(f"Launching {'headless' if _headless else 'visible'} Firefox…")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=_headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+    browser = fid_lib.FidelityAutomation(headless=_headless, save_state=False)
+
+    try:
+        # ── login ─────────────────────────────────────────────────────────────
+        log("Logging in to Fidelity…")
+        step1, step2 = browser.login(
+            username=username,
+            password=password,
+            totp_secret=totp_secret,
+            save_device=True,
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            accept_downloads=True,
+
+        if not step1:
+            raise RuntimeError(
+                "Fidelity login failed — check FIDELITY_USERNAME and FIDELITY_PASSWORD."
+            )
+
+        if not step2:
+            if totp_secret:
+                raise RuntimeError(
+                    "Fidelity 2FA failed — the FIDELITY_TOTP_SECRET may be incorrect.\n"
+                    "Re-enroll your authenticator app to get the correct base32 key."
+                )
+            elif not _headless:
+                # Visible browser — user can complete 2FA manually; just wait
+                log("⚠  2FA required — please complete it in the browser window.")
+                log("Waiting up to 3 minutes…")
+                deadline = time.time() + 180
+                completed = False
+                while time.time() < deadline:
+                    time.sleep(3)
+                    url = browser.page.url.lower()
+                    if "signin" not in url and "login" not in url:
+                        completed = True
+                        break
+                if not completed:
+                    raise RuntimeError("Timed out waiting for manual 2FA.")
+            else:
+                raise RuntimeError(
+                    "Fidelity requires 2FA but FIDELITY_TOTP_SECRET is not set.\n"
+                    "Set FIDELITY_TOTP_SECRET to your authenticator base32 key, or\n"
+                    "set FIDELITY_HEADLESS=0 to complete 2FA in the browser window."
+                )
+
+        log("Login successful.")
+
+        # ── navigate to positions page ─────────────────────────────────────
+        log("Navigating to Portfolio Positions page…")
+        browser.page.goto(
+            "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
         )
-        # Mask automation flags
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-        """)
+        browser.wait_for_loading_sign()
+        browser.page.wait_for_timeout(1_000)
+        browser.wait_for_loading_sign(timeout=int(2.5 * 60 * 1_000))
 
-        page = await context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT)
+        # ── download CSV ───────────────────────────────────────────────────
+        log("Looking for Download button…")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = False
 
+        # New Fidelity UI: "Available Actions" → "Download"
         try:
-            await _login(page, username, password, totp_secret, log)
-            await _download_csv(page, output_path, log)
+            browser.page.get_by_role("button", name="Available Actions").click(timeout=8_000)
+            with browser.page.expect_download(timeout=30_000) as dl_info:
+                browser.page.get_by_role("menuitem", name="Download").click()
+            dl_info.value.save_as(str(output_path))
+            downloaded = True
+            log("Downloaded via 'Available Actions' menu.")
         except Exception:
-            # Save a screenshot for debugging
+            pass
+
+        # Old Fidelity UI: "Download Positions" label/button
+        if not downloaded:
             try:
-                shot = output_path.parent / "fidelity_error.png"
-                await page.screenshot(path=str(shot))
-                log(f"Error screenshot saved → {shot}")
+                with browser.page.expect_download(timeout=30_000) as dl_info:
+                    browser.page.get_by_label("Download Positions").click(timeout=8_000)
+                dl_info.value.save_as(str(output_path))
+                downloaded = True
+                log("Downloaded via 'Download Positions' button.")
             except Exception:
                 pass
-            raise
-        finally:
-            await browser.close()
+
+        if not downloaded:
+            # Save screenshot to help debug
+            try:
+                shot = output_path.parent / "fidelity_error.png"
+                browser.page.screenshot(path=str(shot))
+                log(f"Error screenshot → {shot}")
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Could not find a Download button on the Positions page.\n"
+                "Fidelity may have updated its UI — run with FIDELITY_HEADLESS=0 to inspect."
+            )
+
+        size = output_path.stat().st_size
+        log(f"Saved → {output_path}  ({size:,} bytes)")
+
+    except Exception:
+        # Best-effort error screenshot
+        try:
+            shot = output_path.parent / "fidelity_error.png"
+            browser.page.screenshot(path=str(shot))
+            log(f"Error screenshot → {shot}")
+        except Exception:
+            pass
+        raise
+    finally:
+        browser.close_browser()
+
+
+# ── public async API ───────────────────────────────────────────────────────────
+
+async def run_sync(
+    output_path: Path,
+    headless: bool = True,
+    log=print,
+) -> None:
+    """
+    Async wrapper around _do_sync().
+
+    Runs the synchronous Playwright code in a thread pool so it doesn't
+    block the FastAPI event loop.
+
+    Reads credentials from environment variables:
+      FIDELITY_USERNAME, FIDELITY_PASSWORD, FIDELITY_TOTP_SECRET (optional)
+    """
+    await asyncio.to_thread(_do_sync, output_path, headless, log)
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -344,13 +208,10 @@ if __name__ == "__main__":
         Path(__file__).parent.parent / "blob" / "Portfolio_Positions_Latest.csv"
     )
 
-    async def _main():
-        t0 = time.time()
-        await run_sync(
-            output_path=out,
-            headless=not args.no_headless,
-            log=lambda msg: print(f"[fidelity_sync] {msg}"),
-        )
-        print(f"Done in {time.time()-t0:.1f}s  →  {out}")
-
-    asyncio.run(_main())
+    t0 = time.time()
+    _do_sync(
+        output_path=out,
+        headless=not args.no_headless,
+        log=lambda msg: print(f"[fidelity_sync] {msg}"),
+    )
+    print(f"Done in {time.time() - t0:.1f}s  →  {out}")
