@@ -29,13 +29,19 @@ As a standalone script:
 from __future__ import annotations
 
 import asyncio
+import logging as _logging
 import os
 import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
+
+# Use the same named logger that main.py sets up; NullHandler = silent when run standalone
+_dbg = _logging.getLogger("portfolio")
+_dbg.addHandler(_logging.NullHandler())
 
 
 # ── synchronous core ───────────────────────────────────────────────────────────
@@ -272,9 +278,14 @@ def _extract_positions_from_page(page, log) -> str:
     rows    = raw.get("rows",    [])
 
     if not rows:
+        _dbg.error(
+            f"DOM extraction: no rows found. "
+            f"headers={headers!r}  page_url={page.url!r}"
+        )
         try:
             page.screenshot(path="/tmp/fidelity_no_rows.png")
             log("Debug screenshot → /tmp/fidelity_no_rows.png")
+            _dbg.error("Debug screenshot saved to /tmp/fidelity_no_rows.png")
         except Exception:
             pass
         raise RuntimeError(
@@ -283,6 +294,7 @@ def _extract_positions_from_page(page, log) -> str:
             "run with FIDELITY_HEADLESS=0 to inspect."
         )
 
+    _dbg.info(f"DOM extraction: {len(rows)} rows, {len(headers)} header cols, headers={headers!r}")
     log(f"Found {len(rows)} position rows, {len(headers)} header columns.")
 
     # ── Map UI column names → CSV field indices ────────────────────────────
@@ -456,6 +468,7 @@ class FidelitySession:
     def _navigate_to_positions(self, log) -> None:
         """Navigate to the portfolio positions page and wait for it to fully load."""
         log("Navigating to Portfolio Positions page…")
+        _dbg.debug("FidelitySession: navigating to positions page")
         self._browser.page.goto(
             "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
         )
@@ -464,7 +477,9 @@ class FidelitySession:
         self._browser.wait_for_loading_sign(timeout=int(2.5 * 60 * 1_000))
 
         url = self._browser.page.url.lower()
+        _dbg.debug(f"FidelitySession: positions page loaded, url={url!r}")
         if "signin" in url or "login" in url:
+            _dbg.error(f"FidelitySession: redirected to login page — session expired. url={url!r}")
             raise RuntimeError("Session expired — redirected to login page.")
 
     def _extract_from_page(self, log) -> str:
@@ -563,14 +578,21 @@ class FidelitySession:
             try:
                 if self._is_alive():
                     log("Reusing existing Fidelity session.")
+                    _dbg.debug("get_csv_memory: reusing session")
                 else:
+                    _dbg.debug("get_csv_memory: session not alive, creating new")
                     self._close_browser()
                     self._login(headless, log)
                 return self._extract_from_page(log)
             except Exception as first_err:
+                _dbg.warning(
+                    f"get_csv_memory: first attempt failed — {first_err}\n"
+                    f"{traceback.format_exc()}"
+                )
                 log(f"First attempt failed ({first_err}). Re-logging in…")
 
             # Attempt 2: force fresh login
+            _dbg.debug("get_csv_memory: retrying with fresh login")
             self._close_browser()
             self._login(headless, log)
             return self._extract_from_page(log)

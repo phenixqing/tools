@@ -51,44 +51,79 @@ async function fetchJSON(url, opts) {
 }
 
 /* ────────────────────────────────────────────────────────── */
-/*  UPLOAD                                                    */
+/*  DATA SOURCE BAR (radio-style exclusive selection)         */
 /* ────────────────────────────────────────────────────────── */
-function setupUpload() {
-  const input = document.getElementById("csv-file-input");
-  const zone  = document.getElementById("upload-zone");
-  const status = document.getElementById("upload-status");
+let _activeSource = "fidelity";   // "fidelity" | "upload"
 
-  const doUpload = async (file) => {
-    if (!file) return;
-    status.textContent = "⏳ Uploading…";
-    status.className = "";
-    const fd = new FormData();
-    fd.append("file", file);
-    try {
-      const res = await fetchJSON("/api/upload", { method:"POST", body:fd });
-      currentFile = res.filename;
-      status.textContent = `✓ ${res.filename}`;
-      status.className = "";
-      document.getElementById("holdings-file-tag").textContent = res.filename;
-      comparisonRows = [];   // reset comparisons on new file
-      await reloadAll();
-    } catch(e) {
-      status.textContent = `✗ ${e.message}`;
-      status.className = "error";
+function _setDsStatus(text, cls = "") {
+  const el = document.getElementById("ds-status");
+  if (!el) return;
+  el.textContent = text;
+  el.className   = "ds-status" + (cls ? " " + cls : "");
+  el.title       = text;
+}
+
+function _setDsActive(source) {
+  _activeSource = source;
+  document.getElementById("ds-fidelity")?.classList.toggle("active", source === "fidelity");
+  document.getElementById("ds-upload")?.classList.toggle("active", source === "upload");
+}
+
+async function _doUpload(file) {
+  if (!file) return;
+  _setDsStatus("⏳ Uploading…", "running");
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const res = await fetchJSON("/api/upload", { method: "POST", body: fd });
+    currentFile = res.filename;
+    _setDsStatus(`✓ ${res.filename}`, "done");
+    document.getElementById("holdings-file-tag").textContent = res.filename;
+    comparisonRows = [];
+    await reloadAll();
+  } catch(e) {
+    _setDsStatus(`✗ ${e.message}`, "error");
+  }
+}
+
+function setupDataSource() {
+  const input    = document.getElementById("csv-file-input");
+  const fidBtn   = document.getElementById("ds-fidelity");
+  const upBtn    = document.getElementById("ds-upload");
+
+  // Fidelity button: select it (if not active) OR trigger sync (if already active)
+  fidBtn?.addEventListener("click", async () => {
+    if (_activeSource !== "fidelity") {
+      _setDsActive("fidelity");
+      _setDsStatus("");
+      return;
     }
-  };
-
-  input.addEventListener("change", () => doUpload(input.files[0]));
-
-  // Drag & drop on the zone
-  zone.addEventListener("dragover",  e => { e.preventDefault(); zone.classList.add("drag-over"); });
-  zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
-  zone.addEventListener("drop", e => {
-    e.preventDefault();
-    zone.classList.remove("drag-over");
-    doUpload(e.dataTransfer.files[0]);
+    // Already selected — trigger sync
+    _triggerFidelitySync();
   });
-  zone.addEventListener("click", () => input.click());
+
+  // Upload button: select it and open file picker immediately
+  upBtn?.addEventListener("click", () => {
+    _setDsActive("upload");
+    _setDsStatus("");
+    input.value = "";   // allow re-picking same file
+    input.click();
+  });
+
+  input.addEventListener("change", () => _doUpload(input.files[0]));
+
+  // Drag & drop anywhere in the portfolio tab
+  const zone = document.getElementById("upload-zone");
+  if (zone) {
+    zone.addEventListener("dragover",  e => { e.preventDefault(); zone.classList.add("drag-over"); });
+    zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+    zone.addEventListener("drop", e => {
+      e.preventDefault();
+      zone.classList.remove("drag-over");
+      _setDsActive("upload");
+      _doUpload(e.dataTransfer.files[0]);
+    });
+  }
 }
 
 /* ────────────────────────────────────────────────────────── */
@@ -96,74 +131,67 @@ function setupUpload() {
 /* ────────────────────────────────────────────────────────── */
 let _syncPollTimer = null;
 
+function _fmtAgo(secs) {
+  if (secs < 60)   return `${Math.round(secs)}s ago`;
+  if (secs < 3600) return `${Math.round(secs/60)}m ago`;
+  return `${Math.round(secs/3600)}h ago`;
+}
+
 async function _checkSyncStatus(pollOnRunning = false) {
   try {
-    const s = await fetchJSON("/api/sync/status");
-    const btn   = document.getElementById("fidelity-sync-btn");
-    const label = document.getElementById("sync-status-label");
+    const s   = await fetchJSON("/api/sync/status");
+    const btn = document.getElementById("ds-fidelity");
 
-    // Update button appearance based on creds
-    if (!s.creds_configured) {
+    if (!s.creds_configured && btn) {
       btn.title = "Set FIDELITY_USERNAME + FIDELITY_PASSWORD env vars to enable";
-      btn.classList.add("sync-unconfigured");
     }
 
     if (s.status === "running") {
-      btn.disabled = true;
-      btn.classList.add("sync-running");
-      label.textContent = s.message || "Syncing…";
-      label.className = "sync-label running";
+      btn?.classList.add("ds-running");
+      // Only update status text when Fidelity is the active source
+      if (_activeSource === "fidelity") {
+        _setDsStatus(s.message || "Syncing…", "running");
+      }
       if (pollOnRunning && !_syncPollTimer) {
         _syncPollTimer = setInterval(() => _checkSyncStatus(true), 3000);
       }
     } else {
-      btn.disabled = false;
-      btn.classList.remove("sync-running");
+      btn?.classList.remove("ds-running");
       clearInterval(_syncPollTimer); _syncPollTimer = null;
 
-      if (s.status === "done") {
-        const ago = s.age_secs != null ? ` (${_fmtAgo(s.age_secs)})` : "";
-        label.textContent = `✓ Synced${ago}`;
-        label.className = "sync-label done";
-      } else if (s.status === "error") {
-        label.textContent = `✗ ${s.last_error?.split("\n")[0] || "Error"}`;
-        label.className = "sync-label error";
-        label.title = s.last_error || "";
-      } else {
-        label.textContent = s.creds_configured ? "" : "⚠ creds not set";
-        label.className = "sync-label";
+      if (_activeSource === "fidelity") {
+        if (s.status === "done") {
+          const ago = s.age_secs != null ? ` (${_fmtAgo(s.age_secs)})` : "";
+          _setDsStatus(`✓ Synced${ago}`, "done");
+          // Auto-reload data if the sync just completed (within 5 s)
+          if (s.age_secs != null && s.age_secs < 5) { await reloadAll(); }
+        } else if (s.status === "error") {
+          _setDsStatus(`✗ ${s.last_error?.split("\n")[0] || "Error"}`, "error");
+        } else {
+          _setDsStatus(s.creds_configured ? "" : "⚠ creds not set");
+        }
       }
     }
     return s;
   } catch(_) { return null; }
 }
 
-function _fmtAgo(secs) {
-  if (secs < 60)   return `${secs}s ago`;
-  if (secs < 3600) return `${Math.round(secs/60)}m ago`;
-  return `${Math.round(secs/3600)}h ago`;
-}
-
-document.getElementById("fidelity-sync-btn")?.addEventListener("click", async () => {
-  const btn   = document.getElementById("fidelity-sync-btn");
-  const label = document.getElementById("sync-status-label");
-  btn.disabled = true;
-  label.textContent = "Starting…";
-  label.className = "sync-label running";
+async function _triggerFidelitySync() {
+  const btn = document.getElementById("ds-fidelity");
+  btn?.classList.add("ds-running");
+  _setDsStatus("Starting…", "running");
   try {
     const res = await fetchJSON("/api/sync/fidelity", { method: "POST" });
     if (res.status === "already_running") {
-      label.textContent = "Already running…";
+      _setDsStatus("Already running…", "running");
     }
-    // Start polling for completion
     _checkSyncStatus(true);
     _syncPollTimer = _syncPollTimer || setInterval(() => _checkSyncStatus(true), 3000);
   } catch(e) {
-    label.textContent = `✗ ${e.message}`;
-    label.className = "sync-label error";
-    btn.disabled = false;
+    _setDsStatus(`✗ ${e.message}`, "error");
+    btn?.classList.remove("ds-running");
   }
-});
+}
 
 /* ────────────────────────────────────────────────────────── */
 /*  SUMMARY CARDS                                             */
@@ -1027,7 +1055,10 @@ let _logsInterval = null;
 
 function _startLogsPolling() {
   if (_logsInterval) return;
-  _logsInterval = setInterval(() => loadLogs(true), 5000);
+  _logsInterval = setInterval(() => {
+    if (_activeLogTab === "debug") loadDebugLogs(true);
+    else                           loadLogs(true);
+  }, 5000);
 }
 function _stopLogsPolling() {
   if (_logsInterval) { clearInterval(_logsInterval); _logsInterval = null; }
@@ -1039,7 +1070,7 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
     document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
     document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === `tab-${tab}`));
     if (tab === "settings") { loadSettings(); _stopLogsPolling(); }
-    else if (tab === "logs") { loadLogs(); _startLogsPolling(); }
+    else if (tab === "logs") { _switchLogTab(_activeLogTab); _startLogsPolling(); }
     else { _stopLogsPolling(); }
   });
 });
@@ -1082,7 +1113,8 @@ function _getIntervalSecs() {
 async function loadOngoingSync() {
   try {
     const s = await fetchJSON("/api/sync/ongoing");
-    document.getElementById("ongoing-sync-toggle").checked = !!s.enabled;
+    document.getElementById("ongoing-sync-toggle").checked    = !!s.enabled;
+    document.getElementById("allow-anytime-toggle").checked   = !!s.allow_anytime;
     _setIntervalDisplay(s.interval_secs ?? 300);
     _renderOngoingStatus(s);
   } catch(_) {}
@@ -1153,14 +1185,14 @@ document.getElementById("sync-now-btn")?.addEventListener("click", async () => {
 });
 
 document.getElementById("save-ongoing-btn")?.addEventListener("click", async () => {
-  const enabled = document.getElementById("ongoing-sync-toggle").checked;
-  const interval_mins = parseInt(document.getElementById("ongoing-interval").value) || 5;
+  const enabled       = document.getElementById("ongoing-sync-toggle").checked;
+  const allow_anytime = document.getElementById("allow-anytime-toggle").checked;
   const msg = document.getElementById("ongoing-save-msg");
   try {
     const s = await fetchJSON("/api/sync/ongoing", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, interval_secs: _getIntervalSecs() }),
+      body: JSON.stringify({ enabled, interval_secs: _getIntervalSecs(), allow_anytime }),
     });
     _renderOngoingStatus(s);
     msg.textContent = "✓ Saved";
@@ -1221,13 +1253,8 @@ document.getElementById("test-notif-btn").addEventListener("click", async () => 
 /*  LOGS TAB                                                  */
 /* ────────────────────────────────────────────────────────── */
 const _LOG_LABELS = {
-  csv_load: "CSV 加载",
-  alert:    "告警",
-  warning:  "预警",
-  test:     "测试",
-  setting:  "设置",
-  error:    "错误",
-  sync:     "同步",
+  csv_load: "CSV 加载", alert: "告警", warning: "预警",
+  test: "测试", setting: "设置", error: "错误", sync: "同步",
 };
 const _LOG_ICONS = {
   csv_load: "📂", alert: "🚨", warning: "⚠️", test: "📬",
@@ -1247,17 +1274,12 @@ async function loadLogs(silent = false) {
   if (!silent) list.innerHTML = '<div class="logs-empty">Loading…</div>';
   try {
     const logs = await fetchJSON("/api/logs?limit=200");
-    if (!logs.length) {
-      list.innerHTML = '<div class="logs-empty">No events yet.</div>';
-      return;
-    }
+    if (!logs.length) { list.innerHTML = '<div class="logs-empty">No events yet.</div>'; return; }
     list.innerHTML = logs.map(e => {
-      const type  = e.type || "info";
-      const label = _LOG_LABELS[type] || type;
-      const icon  = _LOG_ICONS[type]  || "ℹ️";
+      const type = e.type || "info";
       return `<div class="log-entry">
         <div class="log-time">${_fmtLogTime(e.time)}</div>
-        <div class="log-badge ${type}">${icon} ${label}</div>
+        <div class="log-badge ${type}">${_LOG_ICONS[type]||"ℹ️"} ${_LOG_LABELS[type]||type}</div>
         <div class="log-msg">${e.message}</div>
       </div>`;
     }).join("");
@@ -1267,7 +1289,60 @@ async function loadLogs(silent = false) {
   }
 }
 
-document.getElementById("refresh-logs-btn").addEventListener("click", () => loadLogs(false));
+/* ── Debug log ─────────────────────────────────────────────── */
+const _DL_LEVEL_RE = /\[(\w+)\s*\]/;
+
+async function loadDebugLogs(silent = false) {
+  const list = document.getElementById("debug-logs-list");
+  const meta = document.getElementById("debug-log-meta");
+  if (!silent) list.innerHTML = '<div class="logs-empty">Loading…</div>';
+  try {
+    const d = await fetchJSON("/api/logs/debug?lines=600");
+    if (meta) {
+      const kb = (d.size_bytes / 1024).toFixed(1);
+      meta.textContent = `${d.total_lines} lines · ${kb} KB`;
+    }
+    if (!d.lines.length) { list.innerHTML = '<div class="logs-empty">Debug log is empty.</div>'; return; }
+    list.innerHTML = d.lines.slice().reverse().map(line => {
+      // Parse: "2026-04-19 10:30:15.123 [INFO ] message..."
+      const ts  = line.slice(0, 23);
+      const m   = line.match(_DL_LEVEL_RE);
+      const lvl = m ? m[1].trim() : "INFO";
+      const msg = line.slice(line.indexOf("]") + 1).trim();
+      return `<div class="debug-log-entry">
+        <span class="dl-time">${ts}</span>
+        <span class="dl-level ${lvl}">${lvl}</span>
+        <span class="dl-msg">${msg.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</span>
+      </div>`;
+    }).join("");
+  } catch(e) {
+    if (!silent)
+      list.innerHTML = `<div class="logs-empty" style="color:var(--red)">Failed to load debug log: ${e.message}</div>`;
+  }
+}
+
+/* ── Log sub-tab switching ─────────────────────────────────── */
+let _activeLogTab = "events";
+
+function _switchLogTab(tab) {
+  _activeLogTab = tab;
+  document.querySelectorAll(".log-tab-btn").forEach(b =>
+    b.classList.toggle("active", b.id === `log-tab-${tab}`)
+  );
+  document.querySelectorAll(".log-panel").forEach(p =>
+    p.classList.toggle("active", p.id === `log-panel-${tab}`)
+  );
+  if (tab === "events") loadLogs(false);
+  else                  loadDebugLogs(false);
+}
+
+document.getElementById("log-tab-events")?.addEventListener("click", () => _switchLogTab("events"));
+document.getElementById("log-tab-debug")?.addEventListener("click",  () => _switchLogTab("debug"));
+
+document.getElementById("refresh-logs-btn").addEventListener("click", () => {
+  if (_activeLogTab === "debug") loadDebugLogs(false);
+  else                           loadLogs(false);
+});
 
 /* ────────────────────────────────────────────────────────── */
 /*  BOOT                                                      */
@@ -1282,8 +1357,12 @@ async function reloadAll() {
 }
 
 (async () => {
-  setupUpload();
-  _checkSyncStatus(false);   // show last-sync status on page load
+  setupDataSource();
+  // Check sync status on load — if a startup sync is running, start polling
+  const s = await _checkSyncStatus(false);
+  if (s?.status === "running") {
+    _syncPollTimer = _syncPollTimer || setInterval(() => _checkSyncStatus(true), 3000);
+  }
   try {
     await reloadAll();
   } catch(err) {

@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
 import time
+import traceback
 import uuid
 from datetime import date, datetime as _dt, timedelta
 from pathlib import Path
@@ -37,12 +40,60 @@ BLOB_CSV   = BLOB_DIR / "Portfolio_Positions_Latest.csv"
 DATA_CSV   = BASE_DIR / "data" / "Portfolio_Positions_Apr-12-2026.csv"
 STATIC_DIR = BASE_DIR / "static"
 
+DEBUG_LOG_FILE    = BLOB_DIR / "debug.log"
+DEBUG_MAX_BYTES   = 1024 * 1024     # 1 MB per file
+DEBUG_KEEP_DAYS   = 7
+
 RISK_FREE_RATE       = 0.045
 AVGO_DIV_YIELD       = 0.013
 PRICE_POLL_SECS      = 5
 FILE_WATCH_SECS      = 5
 ALERT_CHECK_SECS     = 60
 AI_CACHE_TTL_SECS    = 1800   # 30 min
+
+# ── Debug logger (file-backed, 1 MB / 7-day retention) ────────────────────────
+
+def _setup_debug_logger() -> logging.Logger:
+    """Configure the 'portfolio' logger to write to DEBUG_LOG_FILE."""
+    BLOB_DIR.mkdir(parents=True, exist_ok=True)
+    lg = logging.getLogger("portfolio")
+    lg.setLevel(logging.DEBUG)
+    if lg.handlers:
+        return lg   # already configured (e.g. reload)
+    handler = logging.handlers.RotatingFileHandler(
+        str(DEBUG_LOG_FILE), maxBytes=DEBUG_MAX_BYTES, backupCount=1, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    lg.addHandler(handler)
+    return lg
+
+
+def _purge_old_debug_logs() -> None:
+    """Strip log lines older than DEBUG_KEEP_DAYS from the debug log file at startup."""
+    if not DEBUG_LOG_FILE.exists():
+        return
+    try:
+        cutoff = _dt.now() - timedelta(days=DEBUG_KEEP_DAYS)
+        raw    = DEBUG_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        kept   = []
+        for line in raw.splitlines():
+            try:
+                ts = _dt.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+                if ts >= cutoff:
+                    kept.append(line)
+            except (ValueError, IndexError):
+                kept.append(line)   # keep un-parseable lines
+        if len(kept) < len(raw.splitlines()):
+            DEBUG_LOG_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_dbg = _setup_debug_logger()
+_purge_old_debug_logs()
 
 # Telegram
 TG_TOKEN    = "8663670593:AAFcRGQQ7-6MxSiNlyitRicvYcSgidTw7L4"
@@ -115,6 +166,7 @@ _ongoing_state: Dict[str, Any] = {
     "status":        "idle",  # idle | running | done | error
     "last_sync":     None,
     "last_error":    None,
+    "allow_anytime": False,   # bypass Mon–Fri 06:00–13:00 PT restriction (debug)
 }
 _ongoing_task: Optional[asyncio.Task] = None
 
@@ -400,7 +452,9 @@ async def _send_tg(msg: str):
 
 
 def _is_market_hours() -> bool:
-    """True if current Pacific time is Mon–Fri, 06:00–13:00."""
+    """True if current Pacific time is Mon–Fri, 06:00–13:00, or allow_anytime is set."""
+    if _ongoing_state.get("allow_anytime"):
+        return True
     if _PACIFIC is None:
         return True   # no zoneinfo: always allow
     now = _dt.now(_PACIFIC)
@@ -471,16 +525,79 @@ async def _alert_loop():
         await _check_alerts_once()
 
 
+# ── startup sync ───────────────────────────────────────────────────────────────
+
+async def _run_startup_sync() -> None:
+    """
+    Background task: sync from Fidelity at server startup.
+    Falls back to local CSV if Fidelity sync fails.
+    """
+    _dbg.info("Startup sync: begin")
+    try:
+        session = _get_fidelity_session()
+        csv_content = await asyncio.to_thread(
+            session.get_csv_memory, True,
+            lambda msg: _dbg.debug(f"[fidelity] {msg}"),
+        )
+        _st.load_csv_content(csv_content)
+        n_opts = len(_st.portfolio["options"])
+        _sync_state.update({
+            "status":     "done",
+            "last_sync":  time.time(),
+            "message":    f"启动同步完成 — {n_opts} 期权",
+            "last_error": None,
+        })
+        _dbg.info(f"Startup sync: success — {n_opts} options")
+        _log("sync", f"✓ 启动同步 — {n_opts} 期权 (in-memory)")
+    except Exception as exc:
+        err = str(exc)
+        _dbg.error(f"Startup sync failed: {err}\n{traceback.format_exc()}")
+        _sync_state.update({
+            "status":     "error",
+            "last_sync":  time.time(),
+            "last_error": err,
+            "message":    None,
+        })
+        _log("sync", f"✗ 启动同步失败: {err[:80]}")
+        # Fall back to local CSV
+        for csv_path in (BLOB_CSV, DATA_CSV):
+            if csv_path.exists():
+                try:
+                    _st.load_csv(str(csv_path))
+                    _dbg.info(f"Startup sync fallback: loaded {csv_path.name}")
+                    _log("csv_load",
+                         f"回退至本地: {csv_path.name}  "
+                         f"({len(_st.portfolio['options'])} 期权, "
+                         f"{len(_st.portfolio['stocks'])} 股票)")
+                except Exception as e2:
+                    _dbg.error(f"Startup fallback also failed: {e2}")
+                break
+
+
 # ── startup ────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup():
-    csv_path = BLOB_CSV if BLOB_CSV.exists() else DATA_CSV
-    _st.load_csv(str(csv_path))
-    _log("csv_load", f"启动加载: {csv_path.name}  "
-         f"({len(_st.portfolio['options'])} 期权, {len(_st.portfolio['stocks'])} 股票)")
+    """
+    On startup: launch a background Fidelity sync (if creds are configured).
+    If creds are absent, fall back to loading the local CSV immediately.
+    """
     asyncio.create_task(_price_loop())
     asyncio.create_task(_file_loop())
     asyncio.create_task(_alert_loop())
+
+    if os.environ.get("FIDELITY_USERNAME") and os.environ.get("FIDELITY_PASSWORD"):
+        _dbg.info("Startup: Fidelity creds found — launching background sync")
+        _log("sync", "启动: 正在从 Fidelity 同步…")
+        _sync_state.update({"status": "running", "message": "启动同步中…", "last_error": None})
+        asyncio.create_task(_run_startup_sync())
+    else:
+        # No credentials configured: load local CSV immediately
+        csv_path = BLOB_CSV if BLOB_CSV.exists() else DATA_CSV
+        _dbg.info(f"Startup: no Fidelity creds — loading local CSV {csv_path.name}")
+        _st.load_csv(str(csv_path))
+        _log("csv_load",
+             f"启动加载: {csv_path.name}  "
+             f"({len(_st.portfolio['options'])} 期权, {len(_st.portfolio['stocks'])} 股票)")
 
 
 # ── upload ─────────────────────────────────────────────────────────────────────
@@ -489,15 +606,19 @@ async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files accepted.")
     raw = await file.read()
+    _dbg.info(f"CSV upload: {file.filename} ({len(raw):,} bytes)")
     try:
         content = raw.decode("utf-8-sig")
         _st.load_csv_content(content)
     except Exception as exc:
+        _dbg.error(f"CSV upload parse error: {exc}\n{traceback.format_exc()}")
         raise HTTPException(status_code=422, detail=f"Parse error: {exc}")
+    n_opts = len(_st.portfolio["options"])
+    _dbg.info(f"CSV upload success: {n_opts} options, {len(_st.portfolio['stocks'])} stocks")
     _log("csv_load", f"手动上传: {file.filename}  "
-         f"({len(_st.portfolio['options'])} 期权, {len(_st.portfolio['stocks'])} 股票)")
+         f"({n_opts} 期权, {len(_st.portfolio['stocks'])} 股票)")
     return {"status": "ok", "filename": file.filename,
-            "options_count": len(_st.portfolio["options"]),
+            "options_count": n_opts,
             "stocks_count":  len(_st.portfolio["stocks"]),
             "avgo_price":    _st.avgo_price}
 
@@ -868,10 +989,12 @@ def _dated_csv_name() -> str:
 
 async def _run_fidelity_sync_once() -> None:
     """Background task: one-time sync — in-memory via DOM scraping, emits 1 log entry."""
+    _dbg.info("One-time Fidelity sync: begin")
     try:
         session = _get_fidelity_session()
         csv_content = await asyncio.to_thread(
-            session.get_csv_memory, True, lambda _: None
+            session.get_csv_memory, True,
+            lambda msg: _dbg.debug(f"[fidelity] {msg}"),
         )
         _st.load_csv_content(csv_content)
         n_opts = len(_st.portfolio["options"])
@@ -881,9 +1004,11 @@ async def _run_fidelity_sync_once() -> None:
             "message":    f"Synced {n_opts} options",
             "last_error": None,
         })
+        _dbg.info(f"One-time sync success — {n_opts} options")
         _log("sync", f"✓ Sync — {n_opts} options (in-memory)")
     except Exception as exc:
         err = str(exc)
+        _dbg.error(f"One-time sync failed: {err}\n{traceback.format_exc()}")
         _sync_state.update({
             "status":     "error",
             "last_sync":  time.time(),
@@ -897,10 +1022,12 @@ async def _run_ongoing_sync() -> None:
     """One pass of the ongoing sync — in-memory, no disk write, no AI trigger.
     Reuses the persistent FidelitySession browser so no repeated login."""
     _ongoing_state["status"] = "running"
+    _dbg.debug("Ongoing sync: begin")
     try:
         session = _get_fidelity_session()
         csv_content = await asyncio.to_thread(
-            session.get_csv_memory, True, lambda _: None
+            session.get_csv_memory, True,
+            lambda msg: _dbg.debug(f"[fidelity] {msg}"),
         )
         _st.load_csv_content(csv_content)
         _ongoing_state.update({
@@ -910,11 +1037,13 @@ async def _run_ongoing_sync() -> None:
         })
         n_opts = len(_st.portfolio["options"])
         ts = _dt.utcnow().strftime("%H:%M UTC")
+        _dbg.info(f"Ongoing sync success {ts} — {n_opts} options")
         _log("sync", f"✓ Ongoing sync {ts}  ({n_opts} options, in-memory)")
         # Alert check only — skip AI analysis
         asyncio.create_task(_check_alerts_once())
     except Exception as exc:
         err = str(exc)
+        _dbg.error(f"Ongoing sync failed: {err}\n{traceback.format_exc()}")
         _ongoing_state.update({
             "status":     "error",
             "last_sync":  time.time(),
@@ -977,6 +1106,7 @@ class OngoingSyncUpdate(BaseModel):
     enabled:       Optional[bool] = None
     interval_secs: Optional[int]  = None   # seconds (preferred)
     interval_mins: Optional[int]  = None   # minutes (backward compat → converted to secs)
+    allow_anytime: Optional[bool] = None   # bypass market-hours restriction (debug)
 
 
 @app.get("/api/sync/ongoing")
@@ -1002,6 +1132,12 @@ async def update_ongoing_sync(body: OngoingSyncUpdate):
         _ongoing_state["interval_secs"] = max(30, body.interval_secs)
     elif body.interval_mins is not None:
         _ongoing_state["interval_secs"] = max(30, body.interval_mins * 60)
+
+    if body.allow_anytime is not None:
+        _ongoing_state["allow_anytime"] = body.allow_anytime
+        label = "开启" if body.allow_anytime else "关闭"
+        _dbg.info(f"allow_anytime toggled: {body.allow_anytime}")
+        _log("setting", f"允许随时同步 {label} (绕过交易时段限制)")
 
     if body.enabled is not None:
         prev = _ongoing_state["enabled"]
@@ -1039,15 +1175,18 @@ async def sync_now():
         )
 
     filename = _dated_csv_name()
+    _dbg.info(f"Sync Now: begin — {filename}")
     try:
         session = _get_fidelity_session()
         csv_content = await asyncio.to_thread(
-            session.get_csv_memory, True, lambda _: None
+            session.get_csv_memory, True,
+            lambda msg: _dbg.debug(f"[fidelity] {msg}"),
         )
         # Keep snapshot in memory (no disk write)
         _memory_snapshots[filename] = csv_content
         _st.load_csv_content(csv_content)
         n_opts = len(_st.portfolio["options"])
+        _dbg.info(f"Sync Now success — {n_opts} options")
         _log("sync", f"✓ Sync Now — {filename}  ({n_opts} options, in-memory)")
         return {
             "status":        "ok",
@@ -1057,8 +1196,35 @@ async def sync_now():
         }
     except Exception as exc:
         err = str(exc)
+        _dbg.error(f"Sync Now failed: {err}\n{traceback.format_exc()}")
         _log("sync", f"✗ Sync Now failed: {err[:120]}")
         raise HTTPException(status_code=500, detail=err)
+
+
+# ── debug log ──────────────────────────────────────────────────────────────────
+@app.get("/api/logs/debug")
+def get_debug_logs(lines: int = Query(default=500, ge=1, le=5000)):
+    """
+    Return the last N lines from the persistent debug log file.
+    The file is capped at 1 MB and entries older than 7 days are purged at startup.
+    """
+    if not DEBUG_LOG_FILE.exists():
+        return {
+            "lines": [], "total_lines": 0,
+            "size_bytes": 0, "path": str(DEBUG_LOG_FILE),
+        }
+    try:
+        content   = DEBUG_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        all_lines = [l for l in content.splitlines() if l.strip()]
+        return {
+            "lines":       all_lines[-lines:],
+            "total_lines": len(all_lines),
+            "size_bytes":  DEBUG_LOG_FILE.stat().st_size,
+            "path":        str(DEBUG_LOG_FILE),
+        }
+    except Exception as exc:
+        _dbg.error(f"Failed to read debug log: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── static ─────────────────────────────────────────────────────────────────────
