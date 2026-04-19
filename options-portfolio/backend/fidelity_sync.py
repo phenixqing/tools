@@ -43,6 +43,16 @@ from typing import Optional
 _dbg = _logging.getLogger("portfolio")
 _dbg.addHandler(_logging.NullHandler())
 
+_BOT_DETECTION_MSG = (
+    "Fidelity blocked the automated login (bot detection — "
+    "'Sorry, we can't complete this action').\n\n"
+    "Run this one-time setup command to log in with a visible browser and\n"
+    "save the session for future headless syncs:\n\n"
+    "  python backend/fidelity_sync.py --setup\n\n"
+    "A Firefox window will open.  Log in normally (including TOTP if prompted)\n"
+    "and the session will be saved automatically when the window closes."
+)
+
 
 # ── synchronous core ───────────────────────────────────────────────────────────
 
@@ -536,6 +546,21 @@ class FidelitySession:
                     fid.wait_for_loading_sign()
                     url = fid.page.url.lower()
                     _dbg.debug(f"_login: session-restore URL={url!r}")
+
+                    # Check for bot-detection "Sorry" page even during restore
+                    _sorry_restore = False
+                    try:
+                        _sorry_restore = fid.page.get_by_text(
+                            "Sorry, we can't complete this action"
+                        ).is_visible(timeout=1_000)
+                    except Exception:
+                        pass
+                    if _sorry_restore:
+                        _dbg.error("_login: bot-detection during session restore")
+                        fid.save_state = False
+                        fid.close_browser()
+                        raise RuntimeError(_BOT_DETECTION_MSG)
+
                     if not any(kw in url for kw in ("signin", "login")):
                         log("Fidelity session restored from saved state.")
                         _dbg.info(f"_login: session restored, URL={url!r}")
@@ -543,6 +568,8 @@ class FidelitySession:
                         return
                     _dbg.debug("_login: saved session expired — doing fresh login")
                     log("Saved session expired — doing fresh login…")
+                except RuntimeError:
+                    raise  # re-raise bot-detection error
                 except Exception as e:
                     _dbg.warning(f"_login: session-restore check failed ({e}) — doing fresh login")
 
@@ -600,15 +627,7 @@ class FidelitySession:
                     pass
                 fid.save_state = False
                 fid.close_browser()
-                raise RuntimeError(
-                    "Fidelity blocked the automated login (bot detection — "
-                    "'Sorry, we can't complete this action').\n\n"
-                    "One-time setup: run the server with FIDELITY_HEADLESS=0 so a visible\n"
-                    "browser opens, log in manually (including TOTP if prompted), then stop\n"
-                    "the server.  The session will be saved and reused for all future\n"
-                    "headless syncs without prompting for credentials again.\n\n"
-                    "  FIDELITY_HEADLESS=0 python backend/main.py\n"
-                )
+                raise RuntimeError(_BOT_DETECTION_MSG)
 
             # ── TOTP / 2FA handling ──────────────────────────────────────────
             # Detect by input placeholder rather than fragile heading text.
@@ -872,15 +891,86 @@ async def run_sync(
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
+def _cli_setup() -> None:
+    """
+    One-time visible-browser login to save a session for future headless syncs.
+
+    Opens Firefox visibly, logs in (handling TOTP automatically if
+    FIDELITY_TOTP_SECRET is set), then saves the browser storage state to the
+    default session file so subsequent headless syncs skip the login form.
+    """
+    session_file = Path(__file__).parent.parent / "blob" / "fidelity_session.json"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+
+    log = lambda msg: print(f"[setup] {msg}")
+
+    print("=" * 60)
+    print("Fidelity session setup")
+    print("=" * 60)
+    print(f"Session will be saved to: {session_file}")
+    print()
+
+    # Force visible browser regardless of env var
+    os.environ["FIDELITY_HEADLESS"] = "0"
+
+    sess = FidelitySession(session_file=session_file)
+    try:
+        sess._login(headless=False, log=log)
+    except Exception as e:
+        print(f"\n[setup] Login failed: {e}")
+        sys.exit(1)
+
+    # Navigate to positions page to confirm session is good
+    log("Verifying session (navigating to positions page)…")
+    try:
+        sess._fid.page.goto(
+            "https://digital.fidelity.com/ftgw/digital/portfolio/positions",
+            timeout=30_000,
+        )
+        sess._fid.wait_for_loading_sign()
+        sess._fid.page.wait_for_timeout(2_000)
+        url = sess._fid.page.url.lower()
+        if any(kw in url for kw in ("signin", "login")):
+            print(f"\n[setup] Warning: still on auth page after login ({url!r}).")
+            print("         Session may not be saved correctly.")
+        else:
+            log(f"Session verified — on page: {url}")
+    except Exception as e:
+        log(f"Warning: could not verify session: {e}")
+
+    # close_browser() saves the storage state because save_state=True
+    log("Saving session and closing browser…")
+    sess._fid.close_browser()
+    sess._fid = None
+
+    if session_file.exists():
+        print(f"\n✓ Session saved to {session_file}  ({session_file.stat().st_size:,} bytes)")
+        print("  Future syncs will restore this session and skip the login form.")
+    else:
+        print("\n✗ Session file was not created — check for errors above.")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Download Fidelity portfolio CSV")
+    ap.add_argument(
+        "--setup", action="store_true",
+        help=(
+            "One-time setup: open a visible browser, log in, and save the session "
+            "for future headless syncs (use this when bot-detection blocks headless login)"
+        ),
+    )
     ap.add_argument("--no-headless", action="store_true",
                     help="Show browser window (useful for debugging / manual 2FA)")
     ap.add_argument("--output", default=None,
                     help="Output CSV path (default: blob/Portfolio_Positions_Latest.csv)")
     args = ap.parse_args()
+
+    if args.setup:
+        _cli_setup()
+        sys.exit(0)
 
     out = Path(args.output) if args.output else (
         Path(__file__).parent.parent / "blob" / "Portfolio_Positions_Latest.csv"
