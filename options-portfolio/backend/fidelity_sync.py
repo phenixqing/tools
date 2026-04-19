@@ -515,80 +515,149 @@ class FidelitySession:
                 except Exception as e:
                     _dbg.warning(f"_login: session-restore check failed ({e}) — doing fresh login")
 
-            # ── fresh login via FidelityAutomation ─────────────────────────
-            # Note: fidelity.login() catches all its own exceptions internally
-            # and returns (False, False) — it never raises to the caller.
-            log("Logging in to Fidelity…")
-            step1, step2 = fid.login(
-                username=username,
-                password=password,
-                totp_secret=totp_secret,
-                save_device=True,
-            )
+            # ── fresh login — drive fid.page directly ─────────────────────
+            # We do NOT call fid.login() because it detects the TOTP prompt by
+            # a specific heading text that Fidelity has changed.  Instead we
+            # navigate and fill forms ourselves using fid.page (which has all
+            # the Firefox + stealth setup from FidelityAutomation already applied).
+            from playwright.sync_api import TimeoutError as _PwTimeout
 
-            # ── handle login result ────────────────────────────────────────
-            if not step1:
-                # fidelity.login() catches all exceptions and returns (False, False).
-                # Check the actual page state to distinguish bot-detection from bad creds.
-                url_after = fid.page.url.lower()
-                _dbg.error(f"_login: step1=False, URL={url_after!r}")
-                _is_sorry = False
+            log("Navigating to Fidelity login page…")
+            fid.page.goto(
+                "https://digital.fidelity.com/prgw/digital/login/full-page",
+                timeout=60_000,
+            )
+            # Wait for the JS-rendered login form
+            fid.page.get_by_label("Username", exact=True).wait_for(
+                timeout=15_000, state="visible"
+            )
+            fid.page.wait_for_timeout(800)
+            _dbg.debug(f"_login: login page ready, URL={fid.page.url!r}")
+
+            # ── fill credentials ─────────────────────────────────────────────
+            fid.page.get_by_label("Username", exact=True).click()
+            fid.page.wait_for_timeout(250)
+            fid.page.get_by_label("Username", exact=True).type(username, delay=80)
+            fid.page.get_by_label("Password", exact=True).click()
+            fid.page.wait_for_timeout(200)
+            fid.page.get_by_label("Password", exact=True).type(password, delay=60)
+            fid.page.wait_for_timeout(400)
+            fid.page.get_by_role("button", name="Log in").click()
+            _dbg.debug("_login: credentials submitted")
+
+            # ── wait for spinners ────────────────────────────────────────────
+            fid.wait_for_loading_sign()
+            fid.page.wait_for_timeout(1_000)
+            fid.wait_for_loading_sign()
+
+            url_after = fid.page.url.lower()
+            _dbg.debug(f"_login: post-submit URL={url_after!r}")
+
+            # ── bot-detection check ──────────────────────────────────────────
+            _is_sorry = False
+            try:
+                _is_sorry = fid.page.get_by_text(
+                    "Sorry, we can't complete this action"
+                ).is_visible(timeout=1_000)
+            except Exception:
+                pass
+            if _is_sorry:
                 try:
-                    _is_sorry = fid.page.get_by_text(
-                        "Sorry, we can't complete this action"
-                    ).is_visible(timeout=1_000)
+                    fid.page.screenshot(path="/tmp/fidelity_blocked.png")
+                    _dbg.error("Bot-detection screenshot → /tmp/fidelity_blocked.png")
                 except Exception:
                     pass
-                try:
-                    fid.page.screenshot(path="/tmp/fidelity_login_error.png")
-                    _dbg.error("Login-error screenshot → /tmp/fidelity_login_error.png")
-                except Exception:
-                    pass
-                fid.save_state = False   # don't overwrite good session with bad state
+                fid.save_state = False
                 fid.close_browser()
-                if _is_sorry or ("signin" in url_after and "login" not in url_after):
-                    raise RuntimeError(
-                        "Fidelity blocked the automated login (bot detection — "
-                        "'Sorry, we can't complete this action').\n\n"
-                        "One-time setup: run the server with FIDELITY_HEADLESS=0 so a visible\n"
-                        "browser opens, log in manually (including TOTP if prompted), then stop\n"
-                        "the server.  The session will be saved and reused for all future\n"
-                        "headless syncs without prompting for credentials again.\n\n"
-                        "  FIDELITY_HEADLESS=0 python backend/main.py\n"
-                    )
                 raise RuntimeError(
-                    "Fidelity login failed — check FIDELITY_USERNAME and FIDELITY_PASSWORD."
+                    "Fidelity blocked the automated login (bot detection — "
+                    "'Sorry, we can't complete this action').\n\n"
+                    "One-time setup: run the server with FIDELITY_HEADLESS=0 so a visible\n"
+                    "browser opens, log in manually (including TOTP if prompted), then stop\n"
+                    "the server.  The session will be saved and reused for all future\n"
+                    "headless syncs without prompting for credentials again.\n\n"
+                    "  FIDELITY_HEADLESS=0 python backend/main.py\n"
                 )
 
-            if not step2:
-                if not _headless:
-                    # Visible browser: user can complete 2FA manually
-                    log("⚠  2FA required — complete it in the browser window (timeout: 3 min)…")
-                    _dbg.info("_login: waiting for manual 2FA in visible browser")
+            # ── TOTP / 2FA handling ──────────────────────────────────────────
+            # Detect by input placeholder rather than fragile heading text.
+            _on_auth = any(kw in url_after for kw in ("login", "signin", "auth", "2fa", "mfa"))
+            if _on_auth:
+                _dbg.debug(f"_login: on auth/2FA page — attempting TOTP, URL={url_after!r}")
+                if totp_secret:
+                    import pyotp as _pyotp
+                    try:
+                        fid.page.get_by_placeholder("XXXXXX").wait_for(
+                            timeout=12_000, state="visible"
+                        )
+                        code = _pyotp.TOTP(totp_secret).now()
+                        _dbg.debug(f"_login: submitting TOTP (len={len(code)})")
+                        fid.page.get_by_placeholder("XXXXXX").click()
+                        fid.page.get_by_placeholder("XXXXXX").type(code, delay=80)
+                        # Best-effort: check "Don't ask me again on this device"
+                        try:
+                            lbl = fid.page.locator("label").filter(
+                                has_text="Don't ask me again on this"
+                            )
+                            if lbl.is_visible(timeout=2_000):
+                                lbl.check()
+                        except Exception:
+                            pass
+                        fid.page.get_by_role("button", name="Continue").click()
+                        _dbg.debug("_login: TOTP submitted")
+                        fid.wait_for_loading_sign()
+                        fid.page.wait_for_timeout(1_000)
+                        fid.wait_for_loading_sign()
+                    except _PwTimeout:
+                        _dbg.warning(
+                            f"_login: TOTP input not found — URL={fid.page.url!r}. "
+                            "Saving screenshot."
+                        )
+                        try:
+                            fid.page.screenshot(path="/tmp/fidelity_2fa_unknown.png")
+                            _dbg.warning("2FA screenshot → /tmp/fidelity_2fa_unknown.png")
+                        except Exception:
+                            pass
+                        if _headless:
+                            fid.save_state = False
+                            fid.close_browser()
+                            raise RuntimeError(
+                                "Fidelity 2FA prompt not recognized in headless mode.\n"
+                                "Run once with FIDELITY_HEADLESS=0 to complete 2FA manually\n"
+                                "and save the session for future headless syncs."
+                            )
+                elif not _headless:
+                    # No TOTP secret + visible browser → user completes manually
+                    log("⚠  2FA required — complete it in the browser window (3 min timeout)…")
                     deadline = time.time() + 180
                     while time.time() < deadline:
                         time.sleep(3)
                         u = fid.page.url.lower()
-                        if not any(kw in u for kw in ("signin", "login", "auth", "2fa", "mfa")):
+                        if not any(kw in u for kw in ("signin", "login", "auth", "2fa")):
                             break
-                    else:
-                        fid.save_state = False
-                        fid.close_browser()
-                        raise RuntimeError("Timed out waiting for manual 2FA.")
-                elif totp_secret:
-                    fid.save_state = False
-                    fid.close_browser()
-                    raise RuntimeError(
-                        "Fidelity 2FA failed — the FIDELITY_TOTP_SECRET may be incorrect.\n"
-                        "Re-enroll your authenticator app to get the correct base32 key."
-                    )
-                else:
-                    fid.save_state = False
-                    fid.close_browser()
-                    raise RuntimeError(
-                        "Fidelity requires 2FA but FIDELITY_TOTP_SECRET is not set.\n"
-                        "Set FIDELITY_TOTP_SECRET, or run once with FIDELITY_HEADLESS=0."
-                    )
+
+            # ── poll until off auth pages ────────────────────────────────────
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                url_now = fid.page.url.lower()
+                if not any(kw in url_now for kw in ("login", "signin", "auth", "2fa")):
+                    break
+                time.sleep(2)
+
+            url_now = fid.page.url.lower()
+            _dbg.debug(f"_login: final URL={url_now!r}")
+            if any(kw in url_now for kw in ("login", "signin")):
+                try:
+                    fid.page.screenshot(path="/tmp/fidelity_login_failed.png")
+                    _dbg.error("Login still on auth page → /tmp/fidelity_login_failed.png")
+                except Exception:
+                    pass
+                fid.save_state = False
+                fid.close_browser()
+                raise RuntimeError(
+                    "Fidelity login did not complete — still on auth page after 60 s.\n"
+                    "Check FIDELITY_USERNAME, FIDELITY_PASSWORD, FIDELITY_TOTP_SECRET."
+                )
 
             self._fid = fid
             log("Fidelity session established.")
