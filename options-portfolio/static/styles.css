@@ -65,6 +65,26 @@ input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
   letter-spacing: .5px;
 }
 
+/* ── Fidelity sync button ────────────────────────────────── */
+.sync-btn-wrap { display: flex; align-items: center; gap: 6px; }
+.sync-btn { display: flex; align-items: center; gap: 5px; }
+.sync-btn.sync-running { opacity: .65; cursor: not-allowed; }
+.sync-btn.sync-unconfigured { opacity: .5; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.sync-btn.sync-running .sync-icon { display: inline-block; animation: spin 1s linear infinite; }
+
+.sync-label {
+  font-size: .72rem;
+  color: var(--muted);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sync-label.running { color: var(--accent-lt); }
+.sync-label.done    { color: var(--green); }
+.sync-label.error   { color: var(--red); cursor: help; }
+
 /* ── Upload inline button (in header) ───────────────────── */
 .upload-inline-btn {
   background: var(--surface2);
@@ -775,4 +795,5 @@ td input[type=checkbox] { margin: 0; }
 .log-badge.test     { background: rgba(34,197,94,.12);  color: var(--green);     border: 1px solid rgba(34,197,94,.25); }
 .log-badge.setting  { background: rgba(148,163,184,.1); color: var(--muted);     border: 1px solid var(--border); }
 .log-badge.error    { background: rgba(239,68,68,.15);  color: var(--red);       border: 1px solid rgba(239,68,68,.25); }
+.log-badge.sync     { background: rgba(34,211,238,.12); color: #67e8f9;          border: 1px solid rgba(34,211,238,.25); }
 .log-msg { color: var(--text); flex: 1; line-height: 1.5; }

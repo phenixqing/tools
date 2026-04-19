@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"/>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=9"/>
+  <link rel="stylesheet" href="/static/styles.css?v=10"/>
 </head>
 <body>
 
@@ -27,6 +27,12 @@
         <span id="live-price-label">Live Price</span>
       </label>
       <span id="live-price-display" class="live-price-val" style="display:none"></span>
+    </div>
+    <div class="sync-btn-wrap">
+      <button id="fidelity-sync-btn" class="upload-inline-btn sync-btn" title="Pull latest portfolio directly from Fidelity">
+        <span class="sync-icon">↻</span> Sync Fidelity
+      </button>
+      <span id="sync-status-label"></span>
     </div>
     <div class="upload-btn-wrap">
       <label class="upload-inline-btn" for="csv-file-input">⬆ Upload CSV</label>
@@ -311,6 +317,6 @@
 </div>
 </div><!-- /tab-logs -->
 
-<script src="/static/app.js?v=9"></script>
+<script src="/static/app.js?v=10"></script>
 </body>
 </html>
