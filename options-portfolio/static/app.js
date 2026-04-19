@@ -1060,11 +1060,30 @@ async function loadSettings() {
 /* ────────────────────────────────────────────────────────── */
 /*  ONGOING SYNC                                              */
 /* ────────────────────────────────────────────────────────── */
+function _setIntervalDisplay(secs) {
+  const input = document.getElementById("ongoing-interval");
+  const unit  = document.getElementById("ongoing-unit");
+  if (!input || !unit) return;
+  if (secs % 60 === 0) {
+    input.value = secs / 60;
+    unit.value  = "min";
+  } else {
+    input.value = secs;
+    unit.value  = "sec";
+  }
+}
+
+function _getIntervalSecs() {
+  const val  = parseInt(document.getElementById("ongoing-interval")?.value) || 5;
+  const unit = document.getElementById("ongoing-unit")?.value || "min";
+  return unit === "sec" ? Math.max(30, val) : Math.max(1, val) * 60;
+}
+
 async function loadOngoingSync() {
   try {
     const s = await fetchJSON("/api/sync/ongoing");
     document.getElementById("ongoing-sync-toggle").checked = !!s.enabled;
-    document.getElementById("ongoing-interval").value = s.interval_mins ?? 5;
+    _setIntervalDisplay(s.interval_secs ?? 300);
     _renderOngoingStatus(s);
   } catch(_) {}
 }
@@ -1116,7 +1135,7 @@ document.getElementById("save-ongoing-btn")?.addEventListener("click", async () 
     const s = await fetchJSON("/api/sync/ongoing", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, interval_mins }),
+      body: JSON.stringify({ enabled, interval_secs: _getIntervalSecs() }),
     });
     _renderOngoingStatus(s);
     msg.textContent = "✓ Saved";

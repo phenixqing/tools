@@ -302,12 +302,15 @@
         <span class="setting-icon">⏲</span>
         <div>
           <div class="setting-name">Sync interval</div>
-          <div class="setting-hint">How often to pull from Fidelity (minutes)</div>
+          <div class="setting-hint">How often to pull from Fidelity (min 30 s)</div>
         </div>
       </div>
       <div class="setting-input-wrap">
-        <input type="number" id="ongoing-interval" class="setting-input" min="1" max="60" step="1" value="5"/>
-        <span class="setting-unit">min</span>
+        <input type="number" id="ongoing-interval" class="setting-input" min="1" step="1" value="5"/>
+        <select id="ongoing-unit" class="setting-unit-select">
+          <option value="min" selected>min</option>
+          <option value="sec">sec</option>
+        </select>
       </div>
     </div>
 

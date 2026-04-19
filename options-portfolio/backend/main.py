@@ -119,8 +119,8 @@ _sync_state: Dict[str, Any] = {
 # ── Fidelity ongoing sync state ────────────────────────────────────────────────
 _ongoing_state: Dict[str, Any] = {
     "enabled":       False,
-    "interval_mins": 5,
-    "status":        "idle",   # idle | running | done | error
+    "interval_secs": 300,     # default 5 minutes; min 30 s
+    "status":        "idle",  # idle | running | done | error
     "last_sync":     None,
     "last_error":    None,
 }
@@ -912,7 +912,7 @@ async def _ongoing_sync_loop() -> None:
     """Ongoing background loop — respects interval & Mon–Fri 06:00–13:00 PT."""
     while _ongoing_state["enabled"]:
         # Sleep for the configured interval, checking every 30 s for disable
-        interval_secs = _ongoing_state["interval_mins"] * 60
+        interval_secs = _ongoing_state["interval_secs"]
         slept = 0
         while slept < interval_secs:
             await asyncio.sleep(min(30, interval_secs - slept))
@@ -960,7 +960,8 @@ def fidelity_sync_status():
 
 class OngoingSyncUpdate(BaseModel):
     enabled:       Optional[bool] = None
-    interval_mins: Optional[int]  = None
+    interval_secs: Optional[int]  = None   # seconds (preferred)
+    interval_mins: Optional[int]  = None   # minutes (backward compat → converted to secs)
 
 
 @app.get("/api/sync/ongoing")
@@ -982,8 +983,10 @@ async def update_ongoing_sync(body: OngoingSyncUpdate):
     """Enable/disable ongoing sync or change the interval."""
     global _ongoing_task
 
-    if body.interval_mins is not None:
-        _ongoing_state["interval_mins"] = max(1, body.interval_mins)
+    if body.interval_secs is not None:
+        _ongoing_state["interval_secs"] = max(30, body.interval_secs)
+    elif body.interval_mins is not None:
+        _ongoing_state["interval_secs"] = max(30, body.interval_mins * 60)
 
     if body.enabled is not None:
         prev = _ongoing_state["enabled"]
@@ -994,7 +997,9 @@ async def update_ongoing_sync(body: OngoingSyncUpdate):
             if _ongoing_task and not _ongoing_task.done():
                 _ongoing_task.cancel()
             _ongoing_task = asyncio.create_task(_ongoing_sync_loop())
-            _log("setting", f"Ongoing sync 已开启  (间隔 {_ongoing_state['interval_mins']} 分钟，交易时段 Mon–Fri 06:00–13:00 PT)")
+            iv = _ongoing_state['interval_secs']
+            iv_str = f"{iv//60}m {iv%60}s" if iv % 60 else f"{iv//60}m"
+            _log("setting", f"Ongoing sync 已开启  (间隔 {iv_str}，交易时段 Mon–Fri 06:00–13:00 PT)")
         elif not body.enabled and prev:
             # Disabled — the loop will exit naturally on its next 30 s check
             if _ongoing_task and not _ongoing_task.done():

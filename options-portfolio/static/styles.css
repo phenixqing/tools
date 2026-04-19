@@ -673,6 +673,16 @@ td input[type=checkbox] { margin: 0; }
 .settings-save-msg.visible { opacity: 1; }
 
 /* ongoing sync status row */
+.setting-unit-select {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: .8rem;
+  cursor: pointer;
+}
+
 .ongoing-status-row {
   display: flex;
   align-items: center;
