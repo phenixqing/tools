@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Options Portfolio Analyzer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"/>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=9"/>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Options Portfolio Analyzer</h1>
+    <div class="subtitle">AVGO Options · Greeks-based daily scenario projection</div>
+  </div>
+  <div class="header-right">
+    <span class="badge" id="ref-date-badge">Loading…</span>
+    <div class="live-price-wrap">
+      <label class="live-toggle-label" title="Use real-time AVGO price (refreshed every 5s)">
+        <input type="checkbox" id="live-price-toggle"/>
+        <span class="live-toggle-track">
+          <span class="live-dot"></span>
+        </span>
+        <span id="live-price-label">Live Price</span>
+      </label>
+      <span id="live-price-display" class="live-price-val" style="display:none"></span>
+    </div>
+    <div class="upload-btn-wrap">
+      <label class="upload-inline-btn" for="csv-file-input">⬆ Upload CSV</label>
+      <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
+      <span id="upload-status"></span>
+    </div>
+  </div>
+</header>
+
+<!-- Tab navigation -->
+<nav class="tab-nav">
+  <button class="tab-btn active" data-tab="portfolio">📊 Portfolio</button>
+  <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+  <button class="tab-btn" data-tab="logs">📋 Logs</button>
+</nav>
+
+<!-- ═══════════════════════════════════════════════ TAB: PORTFOLIO -->
+<div id="tab-portfolio" class="tab-panel active">
+<main>
+  <!-- Upload drop zone (visible when no file loaded) -->
+  <div id="upload-zone" class="upload-zone" style="display:none">
+    <div class="upload-icon">📂</div>
+    <div class="upload-text">Drop a Fidelity portfolio CSV here, or <label for="csv-file-input" class="upload-link">click to browse</label></div>
+    <div class="upload-hint">Supports the standard Fidelity "Portfolio Positions" export format</div>
+  </div>
+
+  <!-- Summary cards -->
+  <div class="cards">
+    <div class="card"><div class="label">Total Value</div><div class="value" id="card-total">—</div></div>
+    <div class="card"><div class="label">AVGO Price</div><div class="value" id="card-avgo">—</div></div>
+    <div class="card"><div class="label">AVGO Shares</div><div class="value" id="card-shares">—</div></div>
+    <div class="card"><div class="label">Options Value</div><div class="value" id="card-opt">—</div></div>
+    <div class="card"><div class="label">Options P&amp;L</div><div class="value" id="card-pnl">—</div></div>
+    <div class="card"><div class="label">Stocks Value</div><div class="value" id="card-stk">—</div></div>
+    <div class="card"><div class="label">Cash</div><div class="value" id="card-cash">—</div></div>
+  </div>
+
+  <!-- Holdings overview -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Current Holdings</h2>
+      <span id="holdings-file-tag" class="file-tag"></span>
+    </div>
+    <div class="section-body" id="holdings-body">
+      <div class="spinner" id="holdings-spinner"></div>
+      <div id="holdings-content" style="display:none">
+        <div class="holdings-label">Stocks &amp; ETFs</div>
+        <div class="stock-grid" id="stock-grid"></div>
+        <div class="holdings-label" style="margin-top:18px">Option Positions</div>
+        <div class="tbl-wrap">
+          <table id="opt-table">
+            <thead>
+              <tr>
+                <th title="Include in Aggregate P&L"><input type="checkbox" id="chk-all" checked/> Agg</th>
+                <th>Description</th><th>Acct</th><th>Type</th><th>Strike</th>
+                <th>Expiry</th><th>DTE</th><th>Qty</th><th>Mkt Price</th>
+                <th>Position Val</th><th>Cost/Avg</th><th>Cost Total</th><th>Gain/Loss $</th><th>Gain/Loss %</th>
+                <th>IV %</th><th>Delta</th><th>Gamma</th>
+                <th>Theta/day</th><th>Vega/1%</th><th>Rho/1%</th>
+              </tr>
+            </thead>
+            <tbody id="opt-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scenario Comparison -->
+  <div class="section" id="comparison-section" style="display:none">
+    <div class="section-header">
+      <h2>Scenario Comparison</h2>
+      <span style="color:var(--muted);font-size:.78rem">Add price + date points to compare P&amp;L side-by-side</span>
+      <button id="clear-comparison-btn" style="margin-left:auto">✕ Clear all</button>
+    </div>
+    <div class="cmp-add-bar">
+      <div class="cmp-field">
+        <label>Date</label>
+        <input type="date" id="cmp-date" class="cmp-input"/>
+      </div>
+      <div class="cmp-field">
+        <label>AVGO Price ($)</label>
+        <input type="number" id="cmp-price" class="cmp-input" step="0.5" placeholder="e.g. 380"/>
+      </div>
+      <div class="cmp-field cmp-pct-display">
+        <label>vs Current</label>
+        <span id="cmp-pct-live" class="cmp-pct">—</span>
+      </div>
+      <button id="add-comparison-btn" class="btn-accent">+ Add</button>
+    </div>
+    <div id="cmp-cards"></div>
+    <div id="cmp-empty" class="cmp-empty">
+      No saved comparisons yet — add a date and price above.
+    </div>
+  </div>
+
+  <!-- Scenario analysis -->
+  <div class="section">
+    <div class="section-header">
+      <h2>P&amp;L Scenario Analysis</h2>
+      <span style="color:var(--muted);font-size:.78rem">Greeks-based daily projection · AVGO price ±10%</span>
+    </div>
+    <div class="controls">
+      <label>Position:</label>
+      <select id="opt-select">
+        <option value="aggregate">📊 Aggregate (all options)</option>
+      </select>
+      <label style="margin-left:14px">Price type:</label>
+      <div class="toggle-group" id="price-type-toggle">
+        <button class="toggle-btn active" data-val="option_pnl">Option P&amp;L</button>
+        <button class="toggle-btn" data-val="portfolio_pnl">Portfolio P&amp;L <span class="toggle-hint">(Stocks+Options)</span></button>
+      </div>
+      <label style="margin-left:14px">Price steps:</label>
+      <input type="range" id="steps-slider" min="11" max="41" step="2" value="21"/>
+      <span id="steps-label" style="font-size:.8rem;min-width:26px">21</span>
+      <button id="refresh-btn">↻ Refresh</button>
+    </div>
+
+    <div class="spinner" id="sc-spinner"></div>
+    <div id="scenario-content" style="display:none">
+      <div class="greeks-row" id="greeks-display" style="display:none">
+        <div class="greek-card"><div class="g-name">Delta</div><div class="g-val" id="g-delta">—</div></div>
+        <div class="greek-card"><div class="g-name">Gamma</div><div class="g-val" id="g-gamma">—</div></div>
+        <div class="greek-card"><div class="g-name">Theta/day</div><div class="g-val" id="g-theta">—</div></div>
+        <div class="greek-card"><div class="g-name">Vega/1%</div><div class="g-val" id="g-vega">—</div></div>
+        <div class="greek-card"><div class="g-name">IV</div><div class="g-val" id="g-iv">—</div></div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-box">
+          <div class="chart-box-header">
+            <h3 id="curves-title">P&amp;L by Date — multiple price scenarios</h3>
+            <span class="chart-note">Each line = a different AVGO price scenario</span>
+          </div>
+          <div id="price-curves" class="plotly-box plotly-tall"></div>
+        </div>
+      </div>
+      <div class="chart-row">
+        <div class="chart-box">
+          <div class="chart-box-header">
+            <h3>Scenario Preview</h3>
+            <span class="chart-note">↗ Hover over the chart above to compare all price scenarios</span>
+          </div>
+          <div id="hover-live-card" class="hover-live-card"></div>
+        </div>
+      </div>
+
+      <!-- AI Analysis -->
+      <div style="padding:0 16px 4px;">
+        <div class="chart-box" id="ai-analysis-box">
+          <div class="chart-box-header" style="padding-bottom:10px">
+            <h3>AI Risk Analysis</h3>
+            <span class="chart-note">Analyzes selected positions + AVGO outlook (powered by o4-mini thinking)</span>
+            <span id="ai-cache-badge" style="display:none" class="ai-cache-badge"></span>
+            <div class="toggle-group" id="ai-lang-toggle" style="margin-left:auto">
+              <button class="toggle-btn" data-lang="en">EN</button>
+              <button class="toggle-btn active" data-lang="zh">中文</button>
+            </div>
+            <button id="ai-analyze-btn" class="btn-accent" style="margin-left:8px">✦ Analyze Selected</button>
+          </div>
+          <div id="ai-output" class="ai-output">
+            <span class="hp-hint">Click "Analyze Selected" to get an AI risk analysis of the checked option positions.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-row">
+        <div class="chart-box">
+          <div class="chart-box-header">
+            <h3 id="payoff-title">P&amp;L at Expiry vs Stock Price</h3>
+            <span class="chart-note">Hold-to-expiry final P&amp;L</span>
+          </div>
+          <div id="payoff" class="plotly-box"></div>
+        </div>
+      </div>
+
+      <div class="chart-row">
+        <div class="chart-box">
+          <div class="chart-box-header">
+            <h3>P&amp;L Heatmap</h3>
+            <span class="chart-note">Date × Price · green=profit, red=loss</span>
+          </div>
+          <div id="heatmap" class="plotly-box plotly-tall"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+</div><!-- /tab-portfolio -->
+
+<!-- ═══════════════════════════════════════════════ TAB: SETTINGS -->
+<div id="tab-settings" class="tab-panel">
+<div class="settings-wrap">
+
+  <div class="settings-card">
+    <h2 class="settings-card-title">🔔 Notification Thresholds</h2>
+    <p class="settings-card-desc">Alerts fire at most once per contract per day (idempotent).</p>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon warn-icon">⚠️</span>
+        <div>
+          <div class="setting-name">Warning — Contract gain/loss exceeds</div>
+          <div class="setting-hint">Sends a ⚠️ Telegram warning when triggered</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <input type="number" id="setting-warning-pct" class="setting-input" min="0" max="999" step="1" value="70"/>
+        <span class="setting-unit">%</span>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon alert-icon">🚨</span>
+        <div>
+          <div class="setting-name">Alert — Contract gain/loss exceeds</div>
+          <div class="setting-hint">Sends a 🚨 Telegram alert when triggered</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <input type="number" id="setting-alert-pct" class="setting-input" min="0" max="999" step="1" value="100"/>
+        <span class="setting-unit">%</span>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon">📊</span>
+        <div>
+          <div class="setting-name">AVGO daily price change exceeds</div>
+          <div class="setting-hint">Sends alert on large intraday moves (requires Live Price)</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <input type="number" id="setting-avgo-pct" class="setting-input" min="0" max="20" step="0.5" value="3"/>
+        <span class="setting-unit">%</span>
+      </div>
+    </div>
+
+    <div class="settings-actions">
+      <button id="save-settings-btn" class="btn-accent">💾 Save Settings</button>
+      <span id="settings-save-msg" class="settings-save-msg"></span>
+    </div>
+  </div>
+
+  <div class="settings-card">
+    <h2 class="settings-card-title">📡 Notification Channels</h2>
+    <p class="settings-card-desc">Configured delivery channels for alerts and warnings.</p>
+
+    <div class="channels-list">
+      <div class="channel-row">
+        <div class="channel-icon-wrap">✈️</div>
+        <div class="channel-info">
+          <div class="channel-name">Telegram</div>
+          <div class="channel-detail" id="tg-channel-detail">Bot connected</div>
+        </div>
+        <span class="channel-badge active">Active</span>
+      </div>
+    </div>
+
+    <div class="test-notif-bar">
+      <button id="test-notif-btn" class="btn-accent">📬 Send Test Notification</button>
+      <div id="test-notif-result" class="test-notif-result" style="display:none"></div>
+    </div>
+  </div>
+
+</div>
+</div><!-- /tab-settings -->
+
+<!-- ═══════════════════════════════════════════════ TAB: LOGS -->
+<div id="tab-logs" class="tab-panel">
+<div class="logs-wrap">
+  <div class="logs-toolbar">
+    <h2 class="logs-title">Event Log</h2>
+    <span class="logs-subtitle">CSV loads · alerts · threshold changes — newest first</span>
+    <button id="refresh-logs-btn" class="logs-refresh-btn">↻ Refresh</button>
+  </div>
+  <div id="logs-list" class="logs-list">
+    <div class="logs-empty">Loading…</div>
+  </div>
+</div>
+</div><!-- /tab-logs -->
+
+<script src="/static/app.js?v=9"></script>
+</body>
+</html>

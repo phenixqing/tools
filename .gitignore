@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Personal financial data — never commit
+options-portfolio/blob/
+options-portfolio/data/
+
+# Jupyter / Numbers
+*.numbers
+*.ipynb_checkpoints
+
+# Logs
+logs/
+
+# Claude session data
+.claude/
