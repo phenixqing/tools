@@ -20,7 +20,7 @@ FIDELITY_HEADLESS      Set to "0" to show the browser window.
 Usage
 -----
 As a library (called from FastAPI):
-    from fidelity_sync import run_sync
+    from fidelity_sync import run_sync, FidelitySession
     await run_sync(output_path=Path("blob/Portfolio_Positions_Latest.csv"))
 
 As a standalone script:
@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -173,12 +175,196 @@ def _do_sync(output_path: Path, headless: bool, log) -> None:
         browser.close_browser()
 
 
+# ── session-reuse class ────────────────────────────────────────────────────────
+
+class FidelitySession:
+    """
+    Keeps a FidelityAutomation browser alive across multiple syncs so that
+    each subsequent download only navigates to the positions page and clicks
+    Download — no repeated login.
+
+    On session expiry (redirect to login page) the session re-logins
+    automatically.  A threading.Lock ensures only one download at a time.
+    """
+
+    def __init__(self) -> None:
+        self._browser = None          # FidelityAutomation instance or None
+        self._lock    = threading.Lock()
+
+    # ── internal ────────────────────────────────────────────────────────────
+
+    def _is_alive(self) -> bool:
+        """Return True if the existing browser looks usable."""
+        if self._browser is None:
+            return False
+        try:
+            url = self._browser.page.url.lower()
+            # Consider alive if NOT on any login/error page
+            return "signin" not in url and "login" not in url and "error" not in url
+        except Exception:
+            return False
+
+    def _login(self, headless: bool, log) -> None:
+        """Create a fresh browser and log in."""
+        try:
+            from fidelity import fidelity as fid_lib
+        except ImportError:
+            raise RuntimeError("The `fidelity` library is required: pip install fidelity")
+
+        username    = os.environ.get("FIDELITY_USERNAME", "").strip()
+        password    = os.environ.get("FIDELITY_PASSWORD", "").strip()
+        totp_secret = os.environ.get("FIDELITY_TOTP_SECRET", "").strip() or None
+
+        if not username or not password:
+            raise RuntimeError(
+                "FIDELITY_USERNAME and FIDELITY_PASSWORD environment variables must be set."
+            )
+
+        _headless = headless and os.environ.get("FIDELITY_HEADLESS", "1") != "0"
+        log(f"Starting new Fidelity session ({'headless' if _headless else 'visible'})…")
+
+        browser = fid_lib.FidelityAutomation(headless=_headless, save_state=False)
+        step1, step2 = browser.login(
+            username=username,
+            password=password,
+            totp_secret=totp_secret,
+            save_device=True,
+        )
+
+        if not step1:
+            browser.close_browser()
+            raise RuntimeError(
+                "Fidelity login failed — check FIDELITY_USERNAME and FIDELITY_PASSWORD."
+            )
+        if not step2:
+            browser.close_browser()
+            if totp_secret:
+                raise RuntimeError(
+                    "Fidelity 2FA failed — check FIDELITY_TOTP_SECRET."
+                )
+            raise RuntimeError(
+                "Fidelity requires 2FA but FIDELITY_TOTP_SECRET is not set."
+            )
+
+        self._browser = browser
+        log("Fidelity session established.")
+
+    def _close_browser(self) -> None:
+        """Close and discard the current browser (best-effort)."""
+        if self._browser is not None:
+            try:
+                self._browser.close_browser()
+            except Exception:
+                pass
+            self._browser = None
+
+    def _download_to_path(self, output_path: Path, log) -> None:
+        """Navigate to positions page and download CSV (session must already be live)."""
+        log("Navigating to Portfolio Positions page…")
+        self._browser.page.goto(
+            "https://digital.fidelity.com/ftgw/digital/portfolio/positions"
+        )
+        self._browser.wait_for_loading_sign()
+        self._browser.page.wait_for_timeout(1_000)
+        self._browser.wait_for_loading_sign(timeout=int(2.5 * 60 * 1_000))
+
+        # After navigation, verify we're not on a login page
+        url = self._browser.page.url.lower()
+        if "signin" in url or "login" in url:
+            raise RuntimeError("Session expired — redirected to login page.")
+
+        log("Looking for Download button…")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = False
+
+        # New Fidelity UI: "Available Actions" → "Download"
+        try:
+            self._browser.page.get_by_role("button", name="Available Actions").click(timeout=8_000)
+            with self._browser.page.expect_download(timeout=30_000) as dl_info:
+                self._browser.page.get_by_role("menuitem", name="Download").click()
+            dl_info.value.save_as(str(output_path))
+            downloaded = True
+            log("Downloaded via 'Available Actions' menu.")
+        except Exception:
+            pass
+
+        # Old Fidelity UI: "Download Positions" label/button
+        if not downloaded:
+            try:
+                with self._browser.page.expect_download(timeout=30_000) as dl_info:
+                    self._browser.page.get_by_label("Download Positions").click(timeout=8_000)
+                dl_info.value.save_as(str(output_path))
+                downloaded = True
+                log("Downloaded via 'Download Positions' button.")
+            except Exception:
+                pass
+
+        if not downloaded:
+            try:
+                shot = output_path.parent / "fidelity_error.png"
+                self._browser.page.screenshot(path=str(shot))
+                log(f"Error screenshot → {shot}")
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Could not find a Download button on the Positions page."
+            )
+
+        size = output_path.stat().st_size
+        log(f"Saved → {output_path}  ({size:,} bytes)")
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def get_csv_to_path(self, output_path: Path, headless: bool = True, log=print) -> None:
+        """
+        Download positions CSV to output_path, reusing the existing browser
+        session where possible.  Re-logins automatically on session expiry.
+        """
+        with self._lock:
+            # Attempt 1: reuse existing session (or create fresh one if none)
+            try:
+                if self._is_alive():
+                    log("Reusing existing Fidelity session.")
+                else:
+                    self._close_browser()
+                    self._login(headless, log)
+                self._download_to_path(output_path, log)
+                return
+            except Exception as first_err:
+                log(f"First attempt failed ({first_err}). Re-logging in…")
+
+            # Attempt 2: force fresh login
+            self._close_browser()
+            self._login(headless, log)
+            self._download_to_path(output_path, log)
+
+    def get_csv_memory(self, headless: bool = True, log=print) -> str:
+        """
+        Download positions CSV and return its content as a string.
+        Uses a temp file internally; nothing is written to persistent storage.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            tmp_path = Path(f.name)
+        try:
+            self.get_csv_to_path(tmp_path, headless, log)
+            return tmp_path.read_text(encoding="utf-8-sig")
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        """Close the browser session (call on shutdown)."""
+        with self._lock:
+            self._close_browser()
+
+
 # ── public async API ───────────────────────────────────────────────────────────
 
 def _do_sync_to_memory(headless: bool, log) -> str:
-    """Run sync and return CSV content as string (temp file, deleted after read)."""
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+    """Run a standalone sync (fresh login each time) and return CSV as string."""
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
         tmp_path = Path(f.name)
     try:
         _do_sync(tmp_path, headless, log)

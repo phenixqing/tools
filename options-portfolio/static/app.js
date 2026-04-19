@@ -1127,6 +1127,31 @@ function _renderOngoingStatus(s) {
   }
 }
 
+document.getElementById("sync-now-btn")?.addEventListener("click", async () => {
+  const btn = document.getElementById("sync-now-btn");
+  const msg = document.getElementById("sync-now-msg");
+  btn.disabled = true;
+  btn.textContent = "⏳ Syncing…";
+  msg.textContent = "";
+  msg.classList.remove("visible");
+  try {
+    const res = await fetchJSON("/api/sync/now", { method: "POST" });
+    msg.textContent = `✓ Saved ${res.filename}`;
+    msg.style.color = "var(--green)";
+    msg.classList.add("visible");
+    // Reload holdings with the new data
+    await reloadAll();
+  } catch(e) {
+    msg.textContent = `✗ ${e.message.split("\n")[0]}`;
+    msg.style.color = "var(--red)";
+    msg.classList.add("visible");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↻ Sync Now";
+    setTimeout(() => msg.classList.remove("visible"), 5000);
+  }
+});
+
 document.getElementById("save-ongoing-btn")?.addEventListener("click", async () => {
   const enabled = document.getElementById("ongoing-sync-toggle").checked;
   const interval_mins = parseInt(document.getElementById("ongoing-interval").value) || 5;

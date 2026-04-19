@@ -65,8 +65,34 @@ input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
   letter-spacing: .5px;
 }
 
+/* ── Data source bar (Portfolio tab) ─────────────────────── */
+.data-source-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.data-source-label {
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.data-source-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
 /* ── Fidelity sync button ────────────────────────────────── */
-.sync-btn-wrap { display: flex; align-items: center; gap: 6px; }
 .sync-btn { display: flex; align-items: center; gap: 5px; }
 .sync-btn.sync-running { opacity: .65; cursor: not-allowed; }
 .sync-btn.sync-unconfigured { opacity: .5; }
@@ -76,7 +102,7 @@ input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
 .sync-label {
   font-size: .72rem;
   color: var(--muted);
-  max-width: 160px;
+  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -85,7 +111,7 @@ input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
 .sync-label.done    { color: var(--green); }
 .sync-label.error   { color: var(--red); cursor: help; }
 
-/* ── Upload inline button (in header) ───────────────────── */
+/* ── Upload inline button ────────────────────────────────── */
 .upload-inline-btn {
   background: var(--surface2);
   border: 1px solid var(--border);

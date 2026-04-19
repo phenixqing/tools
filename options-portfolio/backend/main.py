@@ -33,7 +33,8 @@ from portfolio_parser import load_portfolio
 
 # ── constants ──────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent.parent
-BLOB_CSV   = Path("/Users/phenixqing/claude/options-portfolio/blob/Portfolio_Positions_Latest.csv")
+BLOB_DIR   = Path("/Users/phenixqing/claude/options-portfolio/blob")
+BLOB_CSV   = BLOB_DIR / "Portfolio_Positions_Latest.csv"
 DATA_CSV   = BASE_DIR / "data" / "Portfolio_Positions_Apr-12-2026.csv"
 STATIC_DIR = BASE_DIR / "static"
 
@@ -125,6 +126,17 @@ _ongoing_state: Dict[str, Any] = {
     "last_error":    None,
 }
 _ongoing_task: Optional[asyncio.Task] = None
+
+# ── Fidelity reusable browser session (lazy-init, shared across syncs) ─────────
+_fidelity_session = None  # FidelitySession instance; created on first use
+
+def _get_fidelity_session():
+    """Return the singleton FidelitySession, creating it if needed."""
+    global _fidelity_session
+    if _fidelity_session is None:
+        from fidelity_sync import FidelitySession
+        _fidelity_session = FidelitySession()
+    return _fidelity_session
 
 # ── notification settings ──────────────────────────────────────────────────────
 _settings: Dict[str, Any] = {
@@ -857,6 +869,16 @@ async def test_notification():
 
 # ── Fidelity sync ──────────────────────────────────────────────────────────────
 
+def _dated_csv_path() -> Path:
+    """Return BLOB_DIR/Portfolio_Positions_Mon-D-YYYY.csv for today."""
+    now   = _dt.now()
+    month = now.strftime("%b")              # Apr
+    day   = str(int(now.strftime("%d")))    # 19 (no leading zero)
+    year  = now.strftime("%Y")
+    BLOB_DIR.mkdir(parents=True, exist_ok=True)
+    return BLOB_DIR / f"Portfolio_Positions_{month}-{day}-{year}.csv"
+
+
 async def _run_fidelity_sync_once() -> None:
     """Background task: one-time sync — writes CSV to disk, emits 1 log entry."""
     from fidelity_sync import run_sync as _fid_sync
@@ -869,7 +891,7 @@ async def _run_fidelity_sync_once() -> None:
             "message":    f"Downloaded {BLOB_CSV.name}",
             "last_error": None,
         })
-        _log("sync", f"✓ Sync Once — {BLOB_CSV.name}  ({n_opts} options)")
+        _log("sync", f"✓ Sync — {BLOB_CSV.name}  ({n_opts} options)")
     except Exception as exc:
         err = str(exc)
         _sync_state.update({
@@ -878,15 +900,18 @@ async def _run_fidelity_sync_once() -> None:
             "last_error": err,
             "message":    None,
         })
-        _log("sync", f"✗ Sync Once failed: {err[:120]}")
+        _log("sync", f"✗ Sync failed: {err[:120]}")
 
 
 async def _run_ongoing_sync() -> None:
-    """One pass of the ongoing sync — in-memory, no disk write, no AI trigger."""
-    from fidelity_sync import run_sync_memory as _fid_mem
+    """One pass of the ongoing sync — in-memory, no disk write, no AI trigger.
+    Reuses the persistent FidelitySession browser so no repeated login."""
     _ongoing_state["status"] = "running"
     try:
-        csv_content = await _fid_mem(headless=True, log=lambda _: None)
+        session = _get_fidelity_session()
+        csv_content = await asyncio.to_thread(
+            session.get_csv_memory, True, lambda _: None
+        )
         _st.load_csv_content(csv_content)
         _ongoing_state.update({
             "status":     "done",
@@ -1008,6 +1033,40 @@ async def update_ongoing_sync(body: OngoingSyncUpdate):
             _log("setting", "Ongoing sync 已关闭")
 
     return {**_ongoing_state, "in_market_hours": _is_market_hours()}
+
+
+@app.post("/api/sync/now")
+async def sync_now():
+    """
+    Manual one-time sync triggered from Settings → Fidelity Sync → Sync Now.
+    Downloads CSV, saves as a dated file under blob/, loads into memory, logs event.
+    """
+    if not os.environ.get("FIDELITY_USERNAME") or not os.environ.get("FIDELITY_PASSWORD"):
+        raise HTTPException(
+            status_code=503,
+            detail="FIDELITY_USERNAME and FIDELITY_PASSWORD environment variables are not set.",
+        )
+
+    output_path = _dated_csv_path()
+    try:
+        session = _get_fidelity_session()
+        await asyncio.to_thread(
+            session.get_csv_to_path, output_path, True, lambda _: None
+        )
+        # Load the downloaded data into memory
+        _st.load_csv(str(output_path))
+        n_opts = len(_st.portfolio["options"])
+        _log("sync", f"✓ Sync Now — {output_path.name}  ({n_opts} options)")
+        return {
+            "status":        "ok",
+            "filename":      output_path.name,
+            "options_count": n_opts,
+            "stocks_count":  len(_st.portfolio["stocks"]),
+        }
+    except Exception as exc:
+        err = str(exc)
+        _log("sync", f"✗ Sync Now failed: {err[:120]}")
+        raise HTTPException(status_code=500, detail=err)
 
 
 # ── static ─────────────────────────────────────────────────────────────────────

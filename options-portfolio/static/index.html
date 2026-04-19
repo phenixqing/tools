@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"/>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=11"/>
+  <link rel="stylesheet" href="/static/styles.css?v=12"/>
 </head>
 <body>
 
@@ -28,17 +28,6 @@
       </label>
       <span id="live-price-display" class="live-price-val" style="display:none"></span>
     </div>
-    <div class="sync-btn-wrap">
-      <button id="fidelity-sync-btn" class="upload-inline-btn sync-btn" title="Pull latest portfolio directly from Fidelity">
-        <span class="sync-icon">↻</span> Sync Fidelity Once
-      </button>
-      <span id="sync-status-label"></span>
-    </div>
-    <div class="upload-btn-wrap">
-      <label class="upload-inline-btn" for="csv-file-input">⬆ Upload CSV</label>
-      <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
-      <span id="upload-status"></span>
-    </div>
   </div>
 </header>
 
@@ -52,7 +41,21 @@
 <!-- ═══════════════════════════════════════════════ TAB: PORTFOLIO -->
 <div id="tab-portfolio" class="tab-panel active">
 <main>
-  <!-- Upload drop zone (visible when no file loaded) -->
+  <!-- Data source bar -->
+  <div class="data-source-bar">
+    <span class="data-source-label">Data Source</span>
+    <div class="data-source-sep"></div>
+    <button id="fidelity-sync-btn" class="upload-inline-btn sync-btn" title="Pull latest portfolio directly from Fidelity">
+      <span class="sync-icon">↻</span> Sync Fidelity
+    </button>
+    <span id="sync-status-label" class="sync-label"></span>
+    <div class="data-source-sep"></div>
+    <label class="upload-inline-btn" for="csv-file-input">⬆ Upload CSV</label>
+    <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
+    <span id="upload-status"></span>
+  </div>
+
+  <!-- Upload drop zone (hidden; drag & drop still supported) -->
   <div id="upload-zone" class="upload-zone" style="display:none">
     <div class="upload-icon">📂</div>
     <div class="upload-text">Drop a Fidelity portfolio CSV here, or <label for="csv-file-input" class="upload-link">click to browse</label></div>
@@ -280,8 +283,21 @@
   </div>
 
   <div class="settings-card">
-    <h2 class="settings-card-title">🔄 Ongoing Fidelity Sync</h2>
-    <p class="settings-card-desc">Automatically re-fetches your portfolio on a schedule. Data is kept in memory — no disk write, AI analysis skipped. Alerts still fire normally.</p>
+    <h2 class="settings-card-title">🔄 Fidelity Sync</h2>
+    <p class="settings-card-desc">Pull the latest portfolio from Fidelity on demand, or run on an automatic schedule. Scheduled syncs are kept in memory — no disk write, AI analysis skipped. Alerts still fire normally.</p>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-icon">↻</span>
+        <div>
+          <div class="setting-name">Manual sync</div>
+          <div class="setting-hint">Downloads and saves a dated CSV to the blob directory</div>
+        </div>
+      </div>
+      <div class="setting-input-wrap">
+        <button id="sync-now-btn" class="btn-accent">↻ Sync Now</button>
+      </div>
+    </div>
 
     <div class="setting-row">
       <div class="setting-label">
@@ -322,6 +338,7 @@
     </div>
 
     <div class="settings-actions">
+      <span id="sync-now-msg" class="settings-save-msg"></span>
       <button id="save-ongoing-btn" class="btn-accent">💾 Save</button>
       <span id="ongoing-save-msg" class="settings-save-msg"></span>
     </div>
@@ -365,6 +382,6 @@
 </div>
 </div><!-- /tab-logs -->
 
-<script src="/static/app.js?v=11"></script>
+<script src="/static/app.js?v=12"></script>
 </body>
 </html>
