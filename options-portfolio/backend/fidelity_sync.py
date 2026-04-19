@@ -951,6 +951,104 @@ def _cli_setup() -> None:
         sys.exit(1)
 
 
+def _cli_manual_login() -> None:
+    """
+    Open a visible Firefox window at the Fidelity login page and wait for the
+    user to log in completely by hand.  Once the browser leaves the auth pages
+    the storage state is saved to blob/fidelity_session.json and the browser
+    closes automatically.
+
+    No credentials or TOTP automation — everything is done manually.
+    """
+    try:
+        from fidelity import fidelity as fid_lib
+    except ImportError:
+        print("ERROR: fidelity library not installed — run: pip install fidelity")
+        sys.exit(1)
+
+    session_file = Path(__file__).parent.parent / "blob" / "fidelity_session.json"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("Fidelity manual login")
+    print("=" * 60)
+    print(f"Session file : {session_file}")
+    print()
+    print("A Firefox window will open.  Log in however you like")
+    print("(password, TOTP, SMS, push notification — anything).")
+    print("Once you reach the portfolio page the browser will save")
+    print("the session and close automatically.")
+    print()
+    print("Press Ctrl+C to cancel.")
+    print()
+
+    fid = fid_lib.FidelityAutomation(
+        headless=False,
+        save_state=True,
+        profile_path=str(session_file),
+    )
+
+    try:
+        fid.page.goto(
+            "https://digital.fidelity.com/prgw/digital/login/full-page",
+            timeout=60_000,
+        )
+        print("Waiting for you to finish logging in (up to 5 minutes)…")
+
+        deadline = time.time() + 300
+        logged_in = False
+        while time.time() < deadline:
+            try:
+                url = fid.page.url.lower()
+            except Exception:
+                break  # browser closed by user
+            if not any(kw in url for kw in ("login", "signin", "auth", "2fa", "mfa")):
+                logged_in = True
+                print(f"\n✓ Detected successful login.")
+                break
+            time.sleep(2)
+
+        if not logged_in:
+            print("\n✗ Timed out — session not saved.")
+            fid.save_state = False
+            fid.close_browser()
+            sys.exit(1)
+
+        # Give the page a moment to fully settle
+        try:
+            fid.page.wait_for_timeout(1_500)
+            fid.wait_for_loading_sign()
+        except Exception:
+            pass
+
+        print("Saving session and closing browser…")
+        fid.close_browser()   # save_state=True → writes session_file
+
+        if session_file.exists():
+            print(f"✓ Session saved  →  {session_file}  ({session_file.stat().st_size:,} bytes)")
+            print("  Future syncs will restore this session automatically.")
+        else:
+            print("✗ Session file was not created — check for errors above.")
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        fid.save_state = False
+        try:
+            fid.close_browser()
+        except Exception:
+            pass
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+        fid.save_state = False
+        try:
+            fid.close_browser()
+        except Exception:
+            pass
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -958,8 +1056,15 @@ if __name__ == "__main__":
     ap.add_argument(
         "--setup", action="store_true",
         help=(
-            "One-time setup: open a visible browser, log in, and save the session "
-            "for future headless syncs (use this when bot-detection blocks headless login)"
+            "One-time setup: open a visible browser, log in automatically "
+            "(uses env-var credentials + TOTP), and save the session"
+        ),
+    )
+    ap.add_argument(
+        "--manual-login", action="store_true",
+        help=(
+            "One-time setup: open a visible browser at the Fidelity login page "
+            "and wait for you to log in fully by hand, then save the session"
         ),
     )
     ap.add_argument("--no-headless", action="store_true",
@@ -967,6 +1072,10 @@ if __name__ == "__main__":
     ap.add_argument("--output", default=None,
                     help="Output CSV path (default: blob/Portfolio_Positions_Latest.csv)")
     args = ap.parse_args()
+
+    if args.manual_login:
+        _cli_manual_login()
+        sys.exit(0)
 
     if args.setup:
         _cli_setup()
