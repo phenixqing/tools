@@ -188,96 +188,103 @@ def _extract_positions_from_page(page, log) -> str:
     Extract portfolio positions directly from the Fidelity positions page DOM.
     Returns a CSV string in Fidelity's standard 16-column download format.
 
-    No download button or file download needed.
-    Tries three selectors in order:
-        1. tr.pvd-table__row  (confirmed Fidelity class from library source)
-        2. table tbody tr     (standard HTML table fallback)
-        3. [role="row"]       (ARIA fallback)
+    Uses Python Playwright APIs — NOT JavaScript querySelectorAll — because
+    Fidelity's positions table is rendered inside Angular Shadow DOM components
+    (pvd-* custom elements).  Playwright's get_by_role() and .locator() calls
+    pierce Shadow DOM automatically; document.querySelectorAll() does not.
 
     Account context is tracked by detecting section header rows that match
     the Fidelity account-number pattern ([A-Z]\\d{5,} or \\d{7,}).
     """
     import csv as _csv
     import io  as _io
+    import re  as _re
 
     log("Waiting for positions table…")
 
+    # Poll until at least one row is visible — Playwright's role selector
+    # pierces Shadow DOM, so this works where wait_for_selector("tr") fails.
     loaded = False
-    for sel in ["tr.pvd-table__row", "table tbody tr", "[role='row']"]:
+    deadline = time.time() + 30
+    while time.time() < deadline:
         try:
-            page.wait_for_selector(sel, timeout=12_000)
-            loaded = True
-            log(f"Table ready (selector: {sel})")
-            break
+            if page.get_by_role("row").count() > 1:
+                loaded = True
+                break
         except Exception:
-            continue
+            pass
+        time.sleep(0.5)
+
     if not loaded:
         raise RuntimeError(
-            "Positions table did not appear within 12 s — page may still be loading."
+            "Positions table did not appear within 30 s — page may still be loading."
         )
 
     log("Extracting table data from DOM…")
 
-    # --- JavaScript runs inside the browser page ----------------------------
-    raw = page.evaluate(r"""
-() => {
-    const clean = s =>
-        (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-    const ACT_RE = /([A-Z]\d{5,}|\d{7,})/;
+    ACT_RE = _re.compile(r'([A-Z]\d{5,}|\d{7,})')
 
-    // ── headers ──────────────────────────────────────────────────────────
-    let hdrEls = document.querySelectorAll('tr.pvd-table__header-row th');
-    if (!hdrEls.length) hdrEls = document.querySelectorAll('thead th');
-    if (!hdrEls.length) hdrEls = document.querySelectorAll('[role="columnheader"]');
-    const headers = Array.from(hdrEls).map(el =>
-        clean(el.innerText || el.textContent)
-    );
+    def _clean(s: str) -> str:
+        return (s or '').replace('\u00a0', ' ').replace('\u200b', '').strip()
 
-    // ── data rows ─────────────────────────────────────────────────────────
-    let rowEls = document.querySelectorAll('tr.pvd-table__row');
-    if (!rowEls.length) rowEls = document.querySelectorAll('table tbody tr');
-    if (!rowEls.length) rowEls = document.querySelectorAll('[role="row"]');
+    # ── Walk every row using Playwright Python API (pierces Shadow DOM) ───────
+    all_rows = page.get_by_role("row").all()
+    _dbg.debug(f"_extract: {len(all_rows)} total rows via get_by_role('row')")
 
-    let curAccNum = '', curAccName = '';
-    const rows = [];
+    headers    = []
+    data_rows  = []
+    curAccNum  = ''
+    curAccName = ''
 
-    Array.from(rowEls).forEach(row => {
-        const tds       = Array.from(row.querySelectorAll('td, [role="cell"]'));
-        const cellTexts = tds.map(td => clean(td.innerText || td.textContent || ''));
-        const rowText   = cellTexts.join(' ');
+    for row in all_rows:
+        # ── Header row? ──────────────────────────────────────────────────────
+        hdr_cells = row.locator("[role='columnheader'], th").all()
+        if hdr_cells:
+            texts = [_clean(c.inner_text()) for c in hdr_cells]
+            if any(texts):           # ignore empty phantom header rows
+                headers = texts
+                _dbg.debug(f"_extract: header row: {headers!r}")
+            continue
 
-        // Account section header: very few cells + contains an account number
-        if (tds.length <= 2) {
-            const m = rowText.match(ACT_RE);
-            if (m) {
-                curAccNum  = m[1];
-                curAccName = rowText.replace(m[1], '').replace(/\s*[-–—,]\s*/g, ' ').trim();
-            }
-            return;
-        }
+        # ── Data cells ───────────────────────────────────────────────────────
+        cells = row.locator("td, [role='gridcell'], [role='cell']").all()
+        if not cells:
+            continue
 
-        // Some layouts put the account number in the first short cell
-        if (cellTexts.length >= 2) {
-            const firstM = cellTexts[0].match(ACT_RE);
-            if (firstM && cellTexts[0].length <= 12) {
-                curAccNum  = firstM[1];
-                curAccName = cellTexts[1] || '';
-                return;
-            }
-        }
+        cell_texts = [_clean(c.inner_text()) for c in cells]
+        row_text   = ' '.join(cell_texts)
 
-        // Regular position row
-        rows.push({ accNum: curAccNum, accName: curAccName, cells: cellTexts });
-    });
+        # Account section header row: ≤ 2 cells + contains an account number
+        if len(cells) <= 2:
+            m = ACT_RE.search(row_text)
+            if m:
+                curAccNum  = m.group(1)
+                curAccName = _re.sub(
+                    r'\s*[-\u2013\u2014,]\s*', ' ',
+                    row_text.replace(m.group(1), ''),
+                ).strip()
+                _dbg.debug(f"_extract: account header: {curAccNum!r} / {curAccName!r}")
+            continue
 
-    return { headers, rows };
-}
-""")
+        # Some layouts put the account number in the first short cell only
+        if len(cell_texts) >= 2:
+            fm = ACT_RE.match(cell_texts[0])
+            if fm and len(cell_texts[0]) <= 12:
+                curAccNum  = fm.group(1)
+                curAccName = cell_texts[1]
+                continue
 
-    headers = raw.get("headers", [])
-    rows    = raw.get("rows",    [])
+        # Skip spacer / total / summary rows with too few non-empty cells
+        if sum(1 for t in cell_texts if t) < 2:
+            continue
 
-    if not rows:
+        data_rows.append({
+            'accNum':  curAccNum,
+            'accName': curAccName,
+            'cells':   cell_texts,
+        })
+
+    if not data_rows:
         _dbg.error(
             f"DOM extraction: no rows found. "
             f"headers={headers!r}  page_url={page.url!r}"
@@ -294,10 +301,12 @@ def _extract_positions_from_page(page, log) -> str:
             "run with FIDELITY_HEADLESS=0 to inspect."
         )
 
-    _dbg.info(f"DOM extraction: {len(rows)} rows, {len(headers)} header cols, headers={headers!r}")
-    log(f"Found {len(rows)} position rows, {len(headers)} header columns.")
+    _dbg.info(f"DOM extraction: {len(data_rows)} rows, {len(headers)} header cols, headers={headers!r}")
+    log(f"Found {len(data_rows)} position rows, {len(headers)} header columns.")
 
-    # ── Map UI column names → CSV field indices ────────────────────────────
+    # ── Map UI column names → CSV field indices ────────────────────────────────
+    # Aliases include both the full download-CSV names and the shorter UI names
+    # that Fidelity's table actually displays (e.g. "Today's gain/loss" without $).
     FIELD_ALIASES: dict = {
         "Symbol":                    ["symbol"],
         "Description":               ["description", "name", "security name"],
@@ -308,6 +317,7 @@ def _extract_positions_from_page(page, log) -> str:
         "Today's Gain/Loss Dollar":  [
             "today's gain/loss $", "today's g/l $", "day g/l $",
             "today gain/loss $", "today's gain/loss dollar",
+            "today's gain/loss",        # UI short form (no $ / %)
         ],
         "Today's Gain/Loss Percent": [
             "today's gain/loss %", "today's g/l %", "day g/l %",
@@ -316,6 +326,7 @@ def _extract_positions_from_page(page, log) -> str:
         "Total Gain/Loss Dollar":    [
             "total gain/loss $", "total g/l $", "unrealized gain/loss $",
             "gain/loss $", "total gain/loss dollar",
+            "total gain/loss",          # UI short form
         ],
         "Total Gain/Loss Percent":   [
             "total gain/loss %", "total g/l %", "unrealized gain/loss %",
@@ -336,15 +347,35 @@ def _extract_positions_from_page(page, log) -> str:
                 col_idx[csv_field] = i
                 break
 
-    # Positional fallback if header detection failed
-    # Typical Fidelity column order (UI table, without account columns):
-    POSITIONAL = [
+    _dbg.debug(f"_extract: column mapping: {col_idx!r}")
+
+    # Positional fallback when header matching yields nothing.
+    # Typical Fidelity UI column order (9-col table as of 2024):
+    #   Symbol | Last price | Today's gain/loss | Total gain/loss |
+    #   Current value | % of account | Quantity | Cost basis | 52-week range
+    POSITIONAL_UI = [
+        "Symbol", "Last Price", "Today's Gain/Loss Dollar", "Total Gain/Loss Dollar",
+        "Current Value", "Percent Of Account", "Quantity", "Cost Basis Total",
+    ]
+    # Fallback to the full download-CSV column order if needed
+    POSITIONAL_DOWNLOAD = [
         "Symbol", "Description", "Quantity", "Last Price", "Last Price Change",
         "Current Value", "Today's Gain/Loss Dollar", "Today's Gain/Loss Percent",
         "Total Gain/Loss Dollar", "Total Gain/Loss Percent",
         "Percent Of Account", "Cost Basis Total", "Average Cost Basis", "Type",
     ]
+
     use_positional = not col_idx
+    # Pick the positional list whose length is closest to our actual cell count
+    if use_positional and data_rows:
+        sample_len = len(data_rows[0]['cells'])
+        if abs(sample_len - len(POSITIONAL_UI)) <= abs(sample_len - len(POSITIONAL_DOWNLOAD)):
+            POSITIONAL = POSITIONAL_UI
+        else:
+            POSITIONAL = POSITIONAL_DOWNLOAD
+        _dbg.debug(f"_extract: using positional fallback ({len(POSITIONAL)}-col), sample_len={sample_len}")
+    else:
+        POSITIONAL = POSITIONAL_DOWNLOAD
 
     def _get(cells: list, field: str) -> str:
         if use_positional:
@@ -358,7 +389,7 @@ def _extract_positions_from_page(page, log) -> str:
                 return ""
         return cells[idx] if idx < len(cells) else ""
 
-    # ── Build CSV string ───────────────────────────────────────────────────
+    # ── Build CSV string ───────────────────────────────────────────────────────
     CSV_COLS = [
         "Account Number", "Account Name", "Symbol", "Description",
         "Quantity", "Last Price", "Last Price Change", "Current Value",
@@ -372,7 +403,7 @@ def _extract_positions_from_page(page, log) -> str:
     writer = _csv.writer(out)
     writer.writerow(CSV_COLS)
 
-    for row in rows:
+    for row in data_rows:
         cells = row["cells"]
         writer.writerow([
             row["accNum"], row["accName"],
