@@ -63,10 +63,20 @@ function _setDsStatus(text, cls = "") {
   el.title       = text;
 }
 
-function _setDsActive(source) {
+function _setDsActive(source, syncApi = false) {
+  const prev = _activeSource;
   _activeSource = source;
   document.getElementById("ds-fidelity")?.classList.toggle("active", source === "fidelity");
   document.getElementById("ds-upload")?.classList.toggle("active", source === "upload");
+
+  // Enable/disable ongoing sync to match the chosen source
+  if (syncApi && source !== prev) {
+    fetchJSON("/api/sync/ongoing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: source === "fidelity" }),
+    }).catch(_ => {});
+  }
 }
 
 async function _doUpload(file) {
@@ -91,20 +101,21 @@ function setupDataSource() {
   const fidBtn   = document.getElementById("ds-fidelity");
   const upBtn    = document.getElementById("ds-upload");
 
-  // Fidelity button: select it (if not active) OR trigger sync (if already active)
+  // Fidelity button: select it (enables ongoing sync) OR trigger one-time sync if already active
   fidBtn?.addEventListener("click", async () => {
     if (_activeSource !== "fidelity") {
-      _setDsActive("fidelity");
+      _setDsActive("fidelity", true);   // switch + enable ongoing sync
       _setDsStatus("");
+      _triggerFidelitySync();           // immediate pull on switch
       return;
     }
-    // Already selected — trigger sync
+    // Already selected — trigger one-time sync
     _triggerFidelitySync();
   });
 
-  // Upload button: select it and open file picker immediately
+  // Upload button: select it (disables ongoing sync) and open file picker
   upBtn?.addEventListener("click", () => {
-    _setDsActive("upload");
+    _setDsActive("upload", true);       // switch + disable ongoing sync
     _setDsStatus("");
     input.value = "";   // allow re-picking same file
     input.click();
@@ -1113,8 +1124,7 @@ function _getIntervalSecs() {
 async function loadOngoingSync() {
   try {
     const s = await fetchJSON("/api/sync/ongoing");
-    document.getElementById("ongoing-sync-toggle").checked    = !!s.enabled;
-    document.getElementById("allow-anytime-toggle").checked   = !!s.allow_anytime;
+    document.getElementById("allow-anytime-toggle").checked = !!s.allow_anytime;
     _setIntervalDisplay(s.interval_secs ?? 300);
     _renderOngoingStatus(s);
   } catch(_) {}
@@ -1142,6 +1152,7 @@ function _renderOngoingStatus(s) {
   } else {
     badge.textContent = "Off";
     badge.className = "ongoing-badge off";
+    badge.title = "Select 'Sync Fidelity' in the Portfolio tab to enable";
   }
 
   lastEl.textContent = s.last_sync
@@ -1149,12 +1160,12 @@ function _renderOngoingStatus(s) {
     : "";
 
   if (s.enabled) {
-    mktEl.textContent = s.in_market_hours
-      ? "📈 Market hours (running)"
-      : "🕐 Outside market hours (paused)";
+    mktEl.textContent = s.allow_anytime
+      ? "⏰ Running anytime (market hours bypassed)"
+      : (s.in_market_hours ? "📈 Market hours (running)" : "🕐 Outside market hours (paused)");
     mktEl.className = s.in_market_hours ? "ongoing-market-hours active" : "ongoing-market-hours muted";
   } else {
-    mktEl.textContent = "Mon–Fri 06:00–13:00 PT";
+    mktEl.textContent = s.allow_anytime ? "⏰ Anytime (bypassed)" : "Mon–Fri 06:00–13:00 PT";
     mktEl.className = "ongoing-market-hours muted";
   }
 }
@@ -1185,14 +1196,13 @@ document.getElementById("sync-now-btn")?.addEventListener("click", async () => {
 });
 
 document.getElementById("save-ongoing-btn")?.addEventListener("click", async () => {
-  const enabled       = document.getElementById("ongoing-sync-toggle").checked;
   const allow_anytime = document.getElementById("allow-anytime-toggle").checked;
   const msg = document.getElementById("ongoing-save-msg");
   try {
     const s = await fetchJSON("/api/sync/ongoing", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, interval_secs: _getIntervalSecs(), allow_anytime }),
+      body: JSON.stringify({ interval_secs: _getIntervalSecs(), allow_anytime }),
     });
     _renderOngoingStatus(s);
     msg.textContent = "✓ Saved";

@@ -284,33 +284,19 @@
 
   <div class="settings-card">
     <h2 class="settings-card-title">🔄 Fidelity Sync</h2>
-    <p class="settings-card-desc">Pull the latest portfolio from Fidelity on demand, or run on an automatic schedule. Scheduled syncs are kept in memory — no disk write, AI analysis skipped. Alerts still fire normally.</p>
+    <p class="settings-card-desc">Ongoing sync is controlled by the <b>Sync Fidelity</b> source selection in the Portfolio tab. Use <em>Sync Now</em> for a one-off immediate pull. All syncs run in-memory — no disk write, AI analysis skipped.</p>
 
     <div class="setting-row">
       <div class="setting-label">
         <span class="setting-icon">↻</span>
         <div>
-          <div class="setting-name">Manual sync</div>
-          <div class="setting-hint">Downloads and saves a dated CSV to the blob directory</div>
+          <div class="setting-name">Sync Now</div>
+          <div class="setting-hint">Immediately pull latest positions from Fidelity (in-memory)</div>
         </div>
       </div>
       <div class="setting-input-wrap">
         <button id="sync-now-btn" class="btn-accent">↻ Sync Now</button>
       </div>
-    </div>
-
-    <div class="setting-row">
-      <div class="setting-label">
-        <span class="setting-icon">⏱</span>
-        <div>
-          <div class="setting-name">Enable ongoing sync</div>
-          <div class="setting-hint">Runs Mon–Fri 06:00–13:00 PT only (unless overridden below)</div>
-        </div>
-      </div>
-      <label class="live-toggle-label">
-        <input type="checkbox" id="ongoing-sync-toggle"/>
-        <span class="live-toggle-track"><span class="live-dot"></span></span>
-      </label>
     </div>
 
     <div class="setting-row">
