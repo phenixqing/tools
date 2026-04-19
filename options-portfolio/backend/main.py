@@ -176,14 +176,14 @@ _fidelity_session = None  # FidelitySession instance; created on first use
 # ── In-memory CSV snapshots (keyed by dated filename, no disk writes) ──────────
 _memory_snapshots: Dict[str, str] = {}
 
-FIDELITY_SESSION_FILE = BLOB_DIR / "fidelity_session.json"
+FIDELITY_SESSION_DIR = BLOB_DIR  # library writes BLOB_DIR/Fidelity.json inside
 
 def _get_fidelity_session():
     """Return the singleton FidelitySession, creating it if needed."""
     global _fidelity_session
     if _fidelity_session is None:
         from fidelity_sync import FidelitySession
-        _fidelity_session = FidelitySession(session_file=FIDELITY_SESSION_FILE)
+        _fidelity_session = FidelitySession(session_dir=FIDELITY_SESSION_DIR)
     return _fidelity_session
 
 # ── notification settings ──────────────────────────────────────────────────────

@@ -444,14 +444,18 @@ class FidelitySession:
 
     Parameters
     ----------
-    session_file : Path | None
-        Where to persist browser storage state.  If ``None``, no disk caching.
+    session_dir : Path | None
+        Directory where the browser storage state is kept.  The fidelity
+        library creates ``{session_dir}/Fidelity.json`` inside it.
+        If ``None``, no disk caching.
     """
 
-    def __init__(self, session_file: Optional[Path] = None) -> None:
-        self._fid          = None        # FidelityAutomation instance, or None
-        self._lock         = threading.Lock()
-        self._session_file = session_file
+    def __init__(self, session_dir: Optional[Path] = None) -> None:
+        self._fid         = None        # FidelityAutomation instance, or None
+        self._lock        = threading.Lock()
+        self._session_dir = session_dir
+        # Actual JSON file the fidelity library creates inside session_dir
+        self._session_file = (session_dir / "Fidelity.json") if session_dir else None
 
     # ── internal helpers ─────────────────────────────────────────────────────
 
@@ -518,12 +522,11 @@ class FidelitySession:
         log(f"Starting new Fidelity session ({'headless' if _headless else 'visible'})…")
         _dbg.debug(f"_login: headless={_headless}, totp={'set' if totp_secret else 'not set'}")
 
-        # Decide whether to use the session file for storage state.
-        # We pass save_state=True so that FidelityAutomation:
-        #   • loads cookies from profile_path on construction
-        #   • saves cookies to profile_path on close_browser()
-        _use_session = self._session_file is not None
-        _profile     = str(self._session_file) if _use_session else "."
+        # The fidelity library treats profile_path as a DIRECTORY and always
+        # appends "Fidelity.json" inside it.  Pass session_dir (the directory),
+        # not the JSON file itself.
+        _use_session = self._session_dir is not None
+        _profile     = str(self._session_dir) if _use_session else "."
 
         fid = fid_lib.FidelityAutomation(
             headless=_headless,
@@ -566,12 +569,22 @@ class FidelitySession:
                         _dbg.info(f"_login: session restored, URL={url!r}")
                         self._fid = fid
                         return
-                    _dbg.debug("_login: saved session expired — doing fresh login")
+                    _dbg.debug("_login: saved session expired — clearing cookies for fresh login")
                     log("Saved session expired — doing fresh login…")
+                    # Clear the stale cookies so they don't poison the fresh login
+                    try:
+                        fid.page.context.clear_cookies()
+                        _dbg.debug("_login: stale cookies cleared")
+                    except Exception as _ce:
+                        _dbg.warning(f"_login: could not clear cookies ({_ce})")
                 except RuntimeError:
                     raise  # re-raise bot-detection error
                 except Exception as e:
-                    _dbg.warning(f"_login: session-restore check failed ({e}) — doing fresh login")
+                    _dbg.warning(f"_login: session-restore check failed ({e}) — clearing cookies for fresh login")
+                    try:
+                        fid.page.context.clear_cookies()
+                    except Exception:
+                        pass
 
             # ── fresh login — drive fid.page directly ─────────────────────
             # We do NOT call fid.login() because it detects the TOTP prompt by
@@ -895,59 +908,112 @@ def _cli_setup() -> None:
     """
     One-time visible-browser login to save a session for future headless syncs.
 
-    Opens Firefox visibly, logs in (handling TOTP automatically if
-    FIDELITY_TOTP_SECRET is set), then saves the browser storage state to the
-    default session file so subsequent headless syncs skip the login form.
+    Credentials + TOTP are filled automatically from env vars.
+    Uses save_state=False so no stale cookies are loaded before login,
+    then saves the storage state manually on success.
     """
-    session_file = Path(__file__).parent.parent / "blob" / "fidelity_session.json"
-    session_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from fidelity import fidelity as fid_lib
+        from playwright.sync_api import TimeoutError as _PwTimeout
+    except ImportError:
+        print("ERROR: fidelity library not installed — run: pip install fidelity")
+        sys.exit(1)
+
+    username    = os.environ.get("FIDELITY_USERNAME", "").strip()
+    password    = os.environ.get("FIDELITY_PASSWORD", "").strip()
+    totp_secret = os.environ.get("FIDELITY_TOTP_SECRET", "").strip() or None
+
+    if not username or not password:
+        print("ERROR: FIDELITY_USERNAME and FIDELITY_PASSWORD must be set.")
+        sys.exit(1)
+
+    session_dir  = Path(__file__).parent.parent / "blob"
+    session_file = session_dir / "Fidelity.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
 
     log = lambda msg: print(f"[setup] {msg}")
 
     print("=" * 60)
-    print("Fidelity session setup")
+    print("Fidelity session setup  (automated credentials)")
     print("=" * 60)
     print(f"Session will be saved to: {session_file}")
     print()
 
-    # Force visible browser regardless of env var
-    os.environ["FIDELITY_HEADLESS"] = "0"
+    # save_state=False → clean browser, no stale cookies loaded
+    fid = fid_lib.FidelityAutomation(headless=False, save_state=False)
 
-    sess = FidelitySession(session_file=session_file)
     try:
-        sess._login(headless=False, log=log)
-    except Exception as e:
-        print(f"\n[setup] Login failed: {e}")
-        sys.exit(1)
-
-    # Navigate to positions page to confirm session is good
-    log("Verifying session (navigating to positions page)…")
-    try:
-        sess._fid.page.goto(
-            "https://digital.fidelity.com/ftgw/digital/portfolio/positions",
-            timeout=30_000,
+        log("Navigating to Fidelity login page…")
+        fid.page.goto(
+            "https://digital.fidelity.com/prgw/digital/login/full-page",
+            timeout=60_000,
         )
-        sess._fid.wait_for_loading_sign()
-        sess._fid.page.wait_for_timeout(2_000)
-        url = sess._fid.page.url.lower()
-        if any(kw in url for kw in ("signin", "login")):
-            print(f"\n[setup] Warning: still on auth page after login ({url!r}).")
-            print("         Session may not be saved correctly.")
+        fid.page.get_by_label("Username", exact=True).wait_for(timeout=15_000, state="visible")
+        fid.page.wait_for_timeout(800)
+
+        fid.page.get_by_label("Username", exact=True).click()
+        fid.page.wait_for_timeout(250)
+        fid.page.get_by_label("Username", exact=True).type(username, delay=80)
+        fid.page.get_by_label("Password", exact=True).click()
+        fid.page.wait_for_timeout(200)
+        fid.page.get_by_label("Password", exact=True).type(password, delay=60)
+        fid.page.wait_for_timeout(400)
+        fid.page.get_by_role("button", name="Log in").click()
+        log("Credentials submitted — waiting…")
+
+        fid.wait_for_loading_sign()
+        fid.page.wait_for_timeout(1_000)
+        fid.wait_for_loading_sign()
+
+        url_after = fid.page.url.lower()
+        _on_auth = any(kw in url_after for kw in ("login", "signin", "auth", "2fa", "mfa"))
+        if _on_auth and totp_secret:
+            import pyotp as _pyotp
+            try:
+                fid.page.get_by_placeholder("XXXXXX").wait_for(timeout=12_000, state="visible")
+                fid.page.get_by_placeholder("XXXXXX").type(_pyotp.TOTP(totp_secret).now(), delay=80)
+                try:
+                    lbl = fid.page.locator("label").filter(has_text="Don't ask me again on this")
+                    if lbl.is_visible(timeout=2_000):
+                        lbl.check()
+                except Exception:
+                    pass
+                fid.page.get_by_role("button", name="Continue").click()
+                fid.wait_for_loading_sign()
+            except _PwTimeout:
+                log("TOTP input not found — please complete 2FA manually in the browser window.")
+
+        # If still on auth page and no TOTP secret, wait for manual completion
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            url_now = fid.page.url.lower()
+            if not any(kw in url_now for kw in ("login", "signin", "auth", "2fa")):
+                break
+            time.sleep(2)
+
+        url_now = fid.page.url.lower()
+        if any(kw in url_now for kw in ("login", "signin")):
+            print(f"\n[setup] Still on auth page after waiting ({url_now!r}).")
+            fid.close_browser()
+            sys.exit(1)
+
+        log("Login successful — saving session…")
+        fid.page.context.storage_state(path=str(session_file))
+        fid.close_browser()
+
+        if session_file.exists():
+            print(f"\n✓ Session saved to {session_file}  ({session_file.stat().st_size:,} bytes)")
+            print("  Future syncs will restore this session and skip the login form.")
         else:
-            log(f"Session verified — on page: {url}")
+            print("\n✗ Session file was not created — check for errors above.")
+            sys.exit(1)
+
     except Exception as e:
-        log(f"Warning: could not verify session: {e}")
-
-    # close_browser() saves the storage state because save_state=True
-    log("Saving session and closing browser…")
-    sess._fid.close_browser()
-    sess._fid = None
-
-    if session_file.exists():
-        print(f"\n✓ Session saved to {session_file}  ({session_file.stat().st_size:,} bytes)")
-        print("  Future syncs will restore this session and skip the login form.")
-    else:
-        print("\n✗ Session file was not created — check for errors above.")
+        print(f"\n[setup] Error: {e}")
+        try:
+            fid.close_browser()
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -955,10 +1021,10 @@ def _cli_manual_login() -> None:
     """
     Open a visible Firefox window at the Fidelity login page and wait for the
     user to log in completely by hand.  Once the browser leaves the auth pages
-    the storage state is saved to blob/fidelity_session.json and the browser
-    closes automatically.
+    the storage state is saved to blob/Fidelity.json and the browser closes.
 
-    No credentials or TOTP automation — everything is done manually.
+    Uses save_state=False so NO existing stale cookies are loaded — the browser
+    starts completely clean.  Storage state is saved manually after login.
     """
     try:
         from fidelity import fidelity as fid_lib
@@ -966,13 +1032,16 @@ def _cli_manual_login() -> None:
         print("ERROR: fidelity library not installed — run: pip install fidelity")
         sys.exit(1)
 
-    session_file = Path(__file__).parent.parent / "blob" / "fidelity_session.json"
-    session_file.parent.mkdir(parents=True, exist_ok=True)
+    # The fidelity library treats profile_path as a directory and writes
+    # Fidelity.json inside it — so session_dir is the directory to use.
+    session_dir  = Path(__file__).parent.parent / "blob"
+    session_file = session_dir / "Fidelity.json"   # actual state file
+    session_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("Fidelity manual login")
     print("=" * 60)
-    print(f"Session file : {session_file}")
+    print(f"Session will be saved to: {session_file}")
     print()
     print("A Firefox window will open.  Log in however you like")
     print("(password, TOTP, SMS, push notification — anything).")
@@ -982,11 +1051,10 @@ def _cli_manual_login() -> None:
     print("Press Ctrl+C to cancel.")
     print()
 
-    fid = fid_lib.FidelityAutomation(
-        headless=False,
-        save_state=True,
-        profile_path=str(session_file),
-    )
+    # IMPORTANT: save_state=False so no stale cookies are loaded into the
+    # browser.  Loading expired/bad cookies triggers Fidelity's bot detection
+    # even before you type anything.
+    fid = fid_lib.FidelityAutomation(headless=False, save_state=False)
 
     try:
         fid.page.goto(
@@ -1010,19 +1078,20 @@ def _cli_manual_login() -> None:
 
         if not logged_in:
             print("\n✗ Timed out — session not saved.")
-            fid.save_state = False
             fid.close_browser()
             sys.exit(1)
 
-        # Give the page a moment to fully settle
+        # Give the page a moment to fully settle before capturing state
         try:
             fid.page.wait_for_timeout(1_500)
             fid.wait_for_loading_sign()
         except Exception:
             pass
 
-        print("Saving session and closing browser…")
-        fid.close_browser()   # save_state=True → writes session_file
+        print("Saving session…")
+        # Save storage state manually (cookies + localStorage → Fidelity.json)
+        fid.page.context.storage_state(path=str(session_file))
+        fid.close_browser()   # save_state=False → just closes, no double-write
 
         if session_file.exists():
             print(f"✓ Session saved  →  {session_file}  ({session_file.stat().st_size:,} bytes)")
@@ -1033,7 +1102,6 @@ def _cli_manual_login() -> None:
 
     except KeyboardInterrupt:
         print("\nCancelled.")
-        fid.save_state = False
         try:
             fid.close_browser()
         except Exception:
@@ -1041,7 +1109,6 @@ def _cli_manual_login() -> None:
         sys.exit(1)
     except Exception as e:
         print(f"\n✗ Error: {e}")
-        fid.save_state = False
         try:
             fid.close_browser()
         except Exception:
