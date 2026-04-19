@@ -516,38 +516,37 @@ class FidelitySession:
                     _dbg.warning(f"_login: session-restore check failed ({e}) — doing fresh login")
 
             # ── fresh login via FidelityAutomation ─────────────────────────
+            # Note: fidelity.login() catches all its own exceptions internally
+            # and returns (False, False) — it never raises to the caller.
             log("Logging in to Fidelity…")
-            try:
-                step1, step2 = fid.login(
-                    username=username,
-                    password=password,
-                    totp_secret=totp_secret,
-                    save_device=True,
-                )
-            except Exception as login_exc:
-                exc_str = str(login_exc)
-                _dbg.error(f"_login: fidelity.login() raised: {exc_str}")
+            step1, step2 = fid.login(
+                username=username,
+                password=password,
+                totp_secret=totp_secret,
+                save_device=True,
+            )
 
-                # Diagnose: bot-detection "Sorry" page?
+            # ── handle login result ────────────────────────────────────────
+            if not step1:
+                # fidelity.login() catches all exceptions and returns (False, False).
+                # Check the actual page state to distinguish bot-detection from bad creds.
+                url_after = fid.page.url.lower()
+                _dbg.error(f"_login: step1=False, URL={url_after!r}")
                 _is_sorry = False
                 try:
                     _is_sorry = fid.page.get_by_text(
                         "Sorry, we can't complete this action"
-                    ).is_visible(timeout=1_500)
+                    ).is_visible(timeout=1_000)
                 except Exception:
                     pass
-
-                url_after = fid.page.url.lower()
-                _dbg.error(f"_login: post-error URL={url_after!r}, is_sorry={_is_sorry}")
                 try:
                     fid.page.screenshot(path="/tmp/fidelity_login_error.png")
                     _dbg.error("Login-error screenshot → /tmp/fidelity_login_error.png")
                 except Exception:
                     pass
-
+                fid.save_state = False   # don't overwrite good session with bad state
+                fid.close_browser()
                 if _is_sorry or ("signin" in url_after and "login" not in url_after):
-                    fid.save_state = False   # don't overwrite good session with bad state
-                    fid.close_browser()
                     raise RuntimeError(
                         "Fidelity blocked the automated login (bot detection — "
                         "'Sorry, we can't complete this action').\n\n"
@@ -557,16 +556,6 @@ class FidelitySession:
                         "headless syncs without prompting for credentials again.\n\n"
                         "  FIDELITY_HEADLESS=0 python backend/main.py\n"
                     )
-
-                # Not a bot-detection page — re-raise original error
-                fid.save_state = False
-                fid.close_browser()
-                raise
-
-            # ── handle login result ────────────────────────────────────────
-            if not step1:
-                fid.save_state = False
-                fid.close_browser()
                 raise RuntimeError(
                     "Fidelity login failed — check FIDELITY_USERNAME and FIDELITY_PASSWORD."
                 )
