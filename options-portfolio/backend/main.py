@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from datetime import date, datetime as _dt, timedelta
@@ -29,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from black_scholes import bs_greeks, implied_vol
-from portfolio_parser import load_portfolio
+from portfolio_parser import load_portfolio, load_portfolio_from_string
 
 # ── constants ──────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent.parent
@@ -73,19 +72,11 @@ class _State:
         self._csv_avgo = prices.get("AVGO", 371.55)
 
     def load_csv_content(self, content: str):
-        """Load portfolio from a CSV string (writes to a temp file, then deletes it)."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".csv", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(content)
-            tmp = f.name
-        try:
-            self.load_csv(tmp)
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        """Load portfolio from a CSV string — pure in-memory, zero disk I/O."""
+        self.portfolio = load_portfolio_from_string(content)
+        prices = {s["symbol"]: s["market_price"] for s in self.portfolio["stocks"]}
+        self.underlying_prices = prices
+        self._csv_avgo = prices.get("AVGO", 371.55)
 
     @property
     def avgo_price(self) -> float:
@@ -129,6 +120,9 @@ _ongoing_task: Optional[asyncio.Task] = None
 
 # ── Fidelity reusable browser session (lazy-init, shared across syncs) ─────────
 _fidelity_session = None  # FidelitySession instance; created on first use
+
+# ── In-memory CSV snapshots (keyed by dated filename, no disk writes) ──────────
+_memory_snapshots: Dict[str, str] = {}
 
 def _get_fidelity_session():
     """Return the singleton FidelitySession, creating it if needed."""
@@ -494,15 +488,12 @@ async def _startup():
 async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files accepted.")
-    content = await file.read()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb")
+    raw = await file.read()
     try:
-        tmp.write(content); tmp.close()
-        _st.load_csv(tmp.name)
+        content = raw.decode("utf-8-sig")
+        _st.load_csv_content(content)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Parse error: {exc}")
-    finally:
-        os.unlink(tmp.name)
     _log("csv_load", f"手动上传: {file.filename}  "
          f"({len(_st.portfolio['options'])} 期权, {len(_st.portfolio['stocks'])} 股票)")
     return {"status": "ok", "filename": file.filename,
@@ -869,29 +860,28 @@ async def test_notification():
 
 # ── Fidelity sync ──────────────────────────────────────────────────────────────
 
-def _dated_csv_path() -> Path:
-    """Return BLOB_DIR/Portfolio_Positions_Mon-D-YYYY.csv for today."""
-    now   = _dt.now()
-    month = now.strftime("%b")              # Apr
-    day   = str(int(now.strftime("%d")))    # 19 (no leading zero)
-    year  = now.strftime("%Y")
-    BLOB_DIR.mkdir(parents=True, exist_ok=True)
-    return BLOB_DIR / f"Portfolio_Positions_{month}-{day}-{year}.csv"
+def _dated_csv_name() -> str:
+    """Return 'Portfolio_Positions_Mon-D-YYYY.csv' for today (no leading zero on day)."""
+    now = _dt.now()
+    return f"Portfolio_Positions_{now.strftime('%b')}-{int(now.strftime('%d'))}-{now.strftime('%Y')}.csv"
 
 
 async def _run_fidelity_sync_once() -> None:
-    """Background task: one-time sync — writes CSV to disk, emits 1 log entry."""
-    from fidelity_sync import run_sync as _fid_sync
+    """Background task: one-time sync — in-memory via DOM scraping, emits 1 log entry."""
     try:
-        await _fid_sync(output_path=BLOB_CSV, log=lambda _: None)  # silent progress
+        session = _get_fidelity_session()
+        csv_content = await asyncio.to_thread(
+            session.get_csv_memory, True, lambda _: None
+        )
+        _st.load_csv_content(csv_content)
         n_opts = len(_st.portfolio["options"])
         _sync_state.update({
             "status":     "done",
             "last_sync":  time.time(),
-            "message":    f"Downloaded {BLOB_CSV.name}",
+            "message":    f"Synced {n_opts} options",
             "last_error": None,
         })
-        _log("sync", f"✓ Sync — {BLOB_CSV.name}  ({n_opts} options)")
+        _log("sync", f"✓ Sync — {n_opts} options (in-memory)")
     except Exception as exc:
         err = str(exc)
         _sync_state.update({
@@ -1039,7 +1029,8 @@ async def update_ongoing_sync(body: OngoingSyncUpdate):
 async def sync_now():
     """
     Manual one-time sync triggered from Settings → Fidelity Sync → Sync Now.
-    Downloads CSV, saves as a dated file under blob/, loads into memory, logs event.
+    Extracts positions via DOM scraping (no download button, no disk write),
+    stores snapshot in memory, and reloads the portfolio.
     """
     if not os.environ.get("FIDELITY_USERNAME") or not os.environ.get("FIDELITY_PASSWORD"):
         raise HTTPException(
@@ -1047,19 +1038,20 @@ async def sync_now():
             detail="FIDELITY_USERNAME and FIDELITY_PASSWORD environment variables are not set.",
         )
 
-    output_path = _dated_csv_path()
+    filename = _dated_csv_name()
     try:
         session = _get_fidelity_session()
-        await asyncio.to_thread(
-            session.get_csv_to_path, output_path, True, lambda _: None
+        csv_content = await asyncio.to_thread(
+            session.get_csv_memory, True, lambda _: None
         )
-        # Load the downloaded data into memory
-        _st.load_csv(str(output_path))
+        # Keep snapshot in memory (no disk write)
+        _memory_snapshots[filename] = csv_content
+        _st.load_csv_content(csv_content)
         n_opts = len(_st.portfolio["options"])
-        _log("sync", f"✓ Sync Now — {output_path.name}  ({n_opts} options)")
+        _log("sync", f"✓ Sync Now — {filename}  ({n_opts} options, in-memory)")
         return {
             "status":        "ok",
-            "filename":      output_path.name,
+            "filename":      filename,
             "options_count": n_opts,
             "stocks_count":  len(_st.portfolio["stocks"]),
         }
