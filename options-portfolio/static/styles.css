@@ -47,8 +47,8 @@ header .subtitle { font-size: .74rem; color: var(--muted); margin-top: 1px; }
 .live-toggle-label input { display: none; }
 .live-toggle-track { position: relative; width: 32px; height: 17px; background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; transition: background .2s; flex-shrink: 0; }
 .live-toggle-track .live-dot { position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--muted); transition: transform .2s, background .2s; }
-input#live-price-toggle:checked ~ .live-toggle-track { background: rgba(99,102,241,.25); border-color: var(--accent); }
-input#live-price-toggle:checked ~ .live-toggle-track .live-dot { background: var(--accent); transform: translateX(15px); }
+.live-toggle-label input:checked ~ .live-toggle-track { background: rgba(99,102,241,.25); border-color: var(--accent); }
+.live-toggle-label input:checked ~ .live-toggle-track .live-dot { background: var(--accent); transform: translateX(15px); }
 input#live-price-toggle:checked ~ .live-price-label { color: var(--accent-lt); }
 .live-price-val { font-size: .82rem; font-weight: 600; color: var(--green); letter-spacing: .3px; }
 .live-price-val.down { color: var(--red); }
